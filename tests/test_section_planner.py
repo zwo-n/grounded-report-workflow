@@ -4,6 +4,8 @@ section_planner.py 유닛 테스트
 테스트 케이스:
 - 정상적인 섹션 계획 생성
 - 빈 응답/파싱 실패 시 기본 섹션 폴백
+- template_hint 있는 경우 few-shot 예시 포함
+- template_hint 없는 경우 순수 동적 생성
 """
 
 import json
@@ -14,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from pipeline.section_planner import plan_sections, _parse_sections_response
+from pipeline.templates import get_template, format_template_as_example, TEMPLATES
 
 
 class TestPlanSections:
@@ -159,3 +162,118 @@ class TestParseSectionsResponse:
         """None 입력 -> 기본 섹션 폴백"""
         result = _parse_sections_response(None)
         assert len(result) == 3
+
+
+class TestTemplateHint:
+    """template_hint 기능 테스트"""
+
+    def test_with_template_hint_includes_example(self):
+        """template_hint 제공 시 프롬프트에 few-shot 예시 포함"""
+        captured_messages = []
+
+        def mock_client(messages):
+            captured_messages.append(messages)
+            return json.dumps({
+                "sections": [
+                    {"title": "서론", "query": "서론 작성", "order": 1},
+                    {"title": "결론", "query": "결론 작성", "order": 2},
+                ]
+            })
+
+        result = plan_sections(
+            user_request="AWS 비용 절감 방안",
+            template_hint="제안서",
+            llm_client=mock_client,
+        )
+
+        user_message = captured_messages[0][1]["content"]
+
+        # 프롬프트에 템플릿 관련 내용 포함 확인
+        assert "제안서" in user_message
+        assert "참고 예시" in user_message
+        assert "현황 분석" in user_message  # 제안서 템플릿의 섹션
+        assert "기대 효과" in user_message  # 제안서 템플릿의 섹션
+
+        # 결과는 정상적으로 반환
+        assert len(result) == 2
+
+    def test_without_template_hint_no_example(self):
+        """template_hint 없으면 few-shot 예시 미포함"""
+        captured_messages = []
+
+        def mock_client(messages):
+            captured_messages.append(messages)
+            return json.dumps({
+                "sections": [
+                    {"title": "서론", "query": "서론 작성", "order": 1},
+                ]
+            })
+
+        plan_sections(
+            user_request="AI 기술 동향 보고서",
+            template_hint=None,  # 명시적으로 None
+            llm_client=mock_client,
+        )
+
+        user_message = captured_messages[0][1]["content"]
+
+        # 템플릿 관련 내용 미포함 확인
+        assert "참고 예시" not in user_message
+        assert "--- 참고 예시 ---" not in user_message
+
+    def test_unknown_template_hint_ignored(self):
+        """존재하지 않는 template_hint는 무시"""
+        captured_messages = []
+
+        def mock_client(messages):
+            captured_messages.append(messages)
+            return json.dumps({"sections": []})
+
+        plan_sections(
+            user_request="테스트 요청",
+            template_hint="존재하지않는템플릿",
+            llm_client=mock_client,
+        )
+
+        user_message = captured_messages[0][1]["content"]
+
+        # 존재하지 않는 템플릿이면 예시 미포함
+        assert "참고 예시" not in user_message
+
+
+class TestTemplates:
+    """templates.py 테스트"""
+
+    def test_get_template_exists(self):
+        """존재하는 템플릿 조회"""
+        template = get_template("제안서")
+        assert template is not None
+        assert "description" in template
+        assert "sections" in template
+        assert len(template["sections"]) > 0
+
+    def test_get_template_not_exists(self):
+        """존재하지 않는 템플릿 조회"""
+        template = get_template("없는템플릿")
+        assert template is None
+
+    def test_format_template_as_example(self):
+        """템플릿을 예시 문자열로 변환"""
+        template = get_template("제안서")
+        example = format_template_as_example(template)
+
+        assert "문서 유형:" in example
+        assert "섹션 구성 예시:" in example
+        assert "서론" in example
+        assert "결론" in example
+
+    def test_templates_have_required_fields(self):
+        """모든 템플릿이 필수 필드를 가지는지 확인"""
+        for name, template in TEMPLATES.items():
+            assert "description" in template, f"{name} 템플릿에 description 없음"
+            assert "sections" in template, f"{name} 템플릿에 sections 없음"
+
+            for section in template["sections"]:
+                assert "title" in section, f"{name} 템플릿 섹션에 title 없음"
+                assert "query" in section, f"{name} 템플릿 섹션에 query 없음"
+                assert "order" in section, f"{name} 템플릿 섹션에 order 없음"

@@ -122,6 +122,7 @@ def process_section(
 def run_pipeline(
     user_request: str,
     output_path: str = "output.docx",
+    template_hint: str | None = None,
     llm_client: Callable[[list[dict]], str] | None = None,
     classifier_client: Callable[[list[dict]], str] | None = None,
     planner_client: Callable[[list[dict]], str] | None = None,
@@ -132,6 +133,7 @@ def run_pipeline(
     Args:
         user_request: 사용자 요청 (예: "클라우드 비용 최적화 제안서 작성해줘")
         output_path: 출력 파일 경로
+        template_hint: 문서 유형 힌트 (예: "제안서", "기술 보고서")
         llm_client: LLM 클라이언트 (None이면 실제 Ollama API 호출)
         classifier_client: 분류용 LLM 클라이언트 (None이면 실제 Ollama API 호출)
         planner_client: 섹션 계획용 LLM 클라이언트 (None이면 실제 Ollama API 호출)
@@ -139,11 +141,15 @@ def run_pipeline(
     print("=" * 60)
     print("Grounded Report Workflow 실행")
     print(f"요청: {user_request}")
+    if template_hint:
+        print(f"템플릿 힌트: {template_hint}")
     print("=" * 60)
 
     # 섹션 구성 동적 생성
     print("\n[섹션 계획 생성 중...]")
-    sections = plan_sections(user_request, llm_client=planner_client)
+    sections = plan_sections(
+        user_request, template_hint=template_hint, llm_client=planner_client
+    )
     print(f"생성된 섹션: {[s['title'] for s in sections]}")
 
     # 문서 생성

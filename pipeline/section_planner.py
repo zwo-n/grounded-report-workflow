@@ -5,13 +5,18 @@ section_planner.py - 섹션 구성 동적 생성 모듈
 단일 LLM 호출로 섹션 제목, 쿼리, 순서를 함께 결정합니다.
 
 사용 예:
+    # 순수 동적 생성
     sections = plan_sections("클라우드 비용 최적화 제안서 작성해줘")
-    # [{"title": "서론", "query": "...", "order": 1}, ...]
+
+    # 템플릿 힌트 제공 (few-shot 예시로 활용)
+    sections = plan_sections("AWS 비용 절감 방안", template_hint="제안서")
 """
 
 import json
 import requests
 from typing import Callable
+
+from pipeline.templates import get_template, format_template_as_example
 
 OLLAMA_BASE_URL = "http://localhost:11434"
 MODEL_NAME = "qwen2.5:7b-instruct-q4_0"
@@ -136,6 +141,7 @@ def _parse_sections_response(raw_output: str) -> list[dict]:
 
 def plan_sections(
     user_request: str,
+    template_hint: str | None = None,
     llm_client: Callable[[list[dict]], str] | None = None,
 ) -> list[dict]:
     """
@@ -143,15 +149,35 @@ def plan_sections(
 
     Args:
         user_request: 사용자 요청 (예: "클라우드 비용 최적화 제안서 작성해줘")
+        template_hint: 문서 유형 힌트 (예: "제안서", "기술 보고서")
+                       제공 시 해당 유형의 섹션 구성을 few-shot 예시로 참고
         llm_client: 테스트용 mock 함수 (None이면 실제 Ollama API 호출)
 
     Returns:
         섹션 리스트: [{"title": str, "query": str, "order": int}, ...]
         order 기준 정렬되어 반환됨
     """
+    # 기본 사용자 메시지
     user_message = f"""사용자 요청: {user_request}
 
 위 요청에 맞는 보고서/제안서의 섹션 구성을 생성해주세요.
+각 섹션의 제목, 작성 질의문, 순서를 JSON 형식으로 응답하세요."""
+
+    # template_hint가 있으면 few-shot 예시 추가
+    if template_hint:
+        template = get_template(template_hint)
+        if template:
+            example_text = format_template_as_example(template)
+            user_message = f"""사용자 요청: {user_request}
+
+아래는 "{template_hint}" 유형 문서의 일반적인 섹션 구성 예시입니다.
+이를 참고하되, 사용자 요청 내용에 맞게 섹션을 조정하세요.
+
+--- 참고 예시 ---
+{example_text}
+--- 참고 예시 끝 ---
+
+위 요청에 맞는 섹션 구성을 생성해주세요.
 각 섹션의 제목, 작성 질의문, 순서를 JSON 형식으로 응답하세요."""
 
     messages = [
