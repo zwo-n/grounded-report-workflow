@@ -1,0 +1,124 @@
+"""
+classifier.py - 섹션 분류 모듈
+
+섹션 제목과 쿼리를 분석하여 필요한 데이터 소스 유형을 분류합니다.
+LLM을 활용하여 섹션의 특성을 파악하고, 적절한 검색 전략을 결정합니다.
+
+분류 결과:
+- "none": 서론/결론처럼 검색 없이 일반적으로 작성 가능한 섹션
+- "internal": 회사 내부 정보(기술 역량, 프로젝트 경험 등)가 필요한 섹션
+- "web": 외부 시장 동향, 경쟁사 정보 등 외부 정보가 필요한 섹션
+"""
+
+import json
+import requests
+from typing import Callable, Literal
+
+OLLAMA_BASE_URL = "http://localhost:11434"
+MODEL_NAME = "qwen2.5:7b-instruct-q4_0"
+
+CLASSIFICATION_PROMPT = """당신은 보고서 섹션 분류 전문가입니다.
+
+주어진 섹션 제목과 쿼리를 분석하여, 이 섹션을 작성하기 위해 어떤 종류의 정보가 필요한지 분류하세요.
+
+분류 기준:
+1. "none": 서론, 결론, 인사말, 맺음말 등 검색 없이 일반적인 문구로 작성 가능한 섹션
+   - 예: "서론", "보고서 개요", "결론", "맺음말", "감사의 글"
+
+2. "internal": 회사 내부 정보가 필요한 섹션
+   - 회사의 기술 역량, 프로젝트 경험, 내부 전략, 조직 구조, 인력 현황 등
+   - 예: "회사 기술 역량", "프로젝트 수행 경험", "차별화 전략", "핵심 인력 소개"
+
+3. "web": 회사 외부 정보가 필요한 섹션
+   - 시장 동향, 경쟁사 분석, 업계 트렌드, 기술 동향, 규제 현황 등
+   - 예: "시장 동향", "경쟁사 분석", "업계 전망", "기술 트렌드"
+
+반드시 아래 JSON 형식으로만 응답하세요. 다른 텍스트는 포함하지 마세요.
+
+{"source_type": "none" 또는 "internal" 또는 "web"}"""
+
+
+def _call_ollama_for_classification(messages: list[dict]) -> str:
+    """
+    Ollama API를 호출하여 분류 결과를 받습니다.
+
+    Args:
+        messages: 대화 메시지 리스트
+
+    Returns:
+        LLM 응답 텍스트
+    """
+    url = f"{OLLAMA_BASE_URL}/api/chat"
+    payload = {
+        "model": MODEL_NAME,
+        "messages": messages,
+        "stream": False,
+        "format": "json",
+    }
+
+    response = requests.post(url, json=payload, timeout=60)
+    response.raise_for_status()
+
+    result = response.json()
+    return result.get("message", {}).get("content", "")
+
+
+def _parse_classification_response(
+    raw_output: str,
+) -> Literal["none", "internal", "web"]:
+    """
+    LLM 응답을 파싱하여 source_type을 추출합니다.
+
+    Args:
+        raw_output: LLM의 원시 응답
+
+    Returns:
+        source_type ("none", "internal", "web")
+        파싱 실패 시 기본값 "internal" 반환 (안전한 폴백)
+    """
+    try:
+        result = json.loads(raw_output)
+        source_type = result.get("source_type", "internal")
+
+        # 유효한 값인지 검증
+        if source_type in ("none", "internal", "web"):
+            return source_type
+        return "internal"  # 유효하지 않은 값이면 internal로 폴백
+
+    except (json.JSONDecodeError, TypeError):
+        return "internal"  # 파싱 실패 시 internal로 폴백
+
+
+def classify_source_type(
+    section_title: str,
+    section_query: str,
+    llm_client: Callable[[list[dict]], str] | None = None,
+) -> Literal["none", "internal", "web"]:
+    """
+    섹션의 source_type을 분류합니다.
+
+    Args:
+        section_title: 섹션 제목 (예: "회사 기술 역량")
+        section_query: 섹션 쿼리 (예: "회사의 주요 기술 역량을 설명해주세요")
+        llm_client: 테스트용 mock 함수 (None이면 실제 Ollama API 호출)
+
+    Returns:
+        "none": 검색 불필요
+        "internal": 사내 RAG 검색 필요
+        "web": 웹 검색 필요
+    """
+    user_message = f"""섹션 제목: {section_title}
+섹션 쿼리: {section_query}
+
+위 섹션을 작성하기 위해 어떤 종류의 정보가 필요한지 분류해주세요."""
+
+    messages = [
+        {"role": "system", "content": CLASSIFICATION_PROMPT},
+        {"role": "user", "content": user_message},
+    ]
+
+    # LLM 호출 (mock 또는 실제 API)
+    client = llm_client if llm_client is not None else _call_ollama_for_classification
+    raw_output = client(messages)
+
+    return _parse_classification_response(raw_output)
