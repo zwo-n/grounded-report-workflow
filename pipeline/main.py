@@ -74,23 +74,13 @@ def process_section(
 
     # 2. 분류 결과에 따른 처리
     if classified_type == "none":
-        # 검색 없이 바로 LLM 호출
+        # 검색 없이 LLM 호출 (llm_writer가 none 타입 전용 프롬프트 사용)
         llm_result = generate_section_draft(
             section_query=query,
             sources=[],
             source_type="none",
             llm_client=llm_client,
         )
-        # sources가 빈 리스트면 generate_section_draft가 LLM 호출을 스킵하므로
-        # none 타입은 고정 응답 사용
-        if not llm_result.get("answer"):
-            llm_result = {
-                "answer": "본 보고서는 회사의 기술 역량과 시장 내 차별화 전략을 종합적으로 정리한 문서입니다. 2024년 주요 프로젝트 성과와 향후 발전 방향을 함께 다루고 있습니다.",
-                "source_type": "none",
-                "source_count": 0,
-                "source_relevance": "low",
-                "has_fabrication_risk": False,
-            }
         decision = route(
             source_type=llm_result["source_type"],
             source_count=llm_result["source_count"],

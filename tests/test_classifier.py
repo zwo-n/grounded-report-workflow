@@ -119,13 +119,16 @@ class TestProcessSectionIntegration:
     """process_section과 classifier 통합 테스트"""
 
     def test_none_classification_flow(self):
-        """none 분류 -> 검색 없이 처리"""
+        """none 분류 -> 검색 없이 LLM 호출"""
         from pipeline.main import process_section
 
         def mock_classifier(messages):
             return json.dumps({"source_type": "none"})
 
+        llm_call_count = [0]
+
         def mock_llm(messages):
+            llm_call_count[0] += 1
             return json.dumps({
                 "answer": "테스트 서론입니다.",
                 "source_type": "none",
@@ -143,7 +146,9 @@ class TestProcessSectionIntegration:
 
         assert classified_type == "none"
         assert llm_result["source_type"] == "none"
+        assert llm_result["answer"] == "테스트 서론입니다."  # LLM 생성 답변 확인
         assert len(sources) == 0
+        assert llm_call_count[0] == 1  # LLM이 실제로 호출되었는지 확인
 
     def test_internal_classification_flow(self):
         """internal 분류 -> 내부 검색 수행"""

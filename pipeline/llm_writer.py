@@ -62,6 +62,31 @@ has_fabrication_risk 판단 기준:
 - true: 출처에서 확인할 수 없는 내용이 포함됨"""
 
 
+SYSTEM_PROMPT_NONE = """당신은 보고서 작성을 돕는 AI 어시스턴트입니다.
+
+이 섹션은 서론, 결론, 인사말 등 검색 결과 없이 작성하는 일반적인 섹션입니다.
+문서의 맥락에 맞는 자연스럽고 전문적인 내용을 작성하세요.
+
+중요한 규칙:
+1. 구체적인 수치, 날짜, 고유명사 등 검증이 필요한 정보는 포함하지 마세요.
+2. 일반적이고 보편적인 내용으로 작성하세요.
+3. 문서의 도입부나 마무리에 적합한 톤으로 작성하세요.
+
+응답 형식:
+반드시 아래 JSON 형식으로만 응답하세요. 다른 텍스트는 포함하지 마세요.
+
+{
+    "answer": "작성한 내용",
+    "source_type": "none",
+    "source_count": 0,
+    "source_relevance": "low",
+    "has_fabrication_risk": false
+}
+
+has_fabrication_risk는 구체적인 사실을 지어낸 경우에만 true입니다.
+일반적인 서술은 false로 설정하세요."""
+
+
 def _call_ollama(messages: list[dict]) -> str:
     """
     Ollama API를 호출하여 응답을 받습니다.
@@ -118,6 +143,46 @@ def _format_sources(sources: list[dict]) -> str:
         formatted_parts.append(part)
 
     return "\n\n".join(formatted_parts)
+
+
+def _generate_none_section(
+    section_query: str,
+    llm_client: Callable[[list[dict]], str] | None = None,
+) -> dict:
+    """
+    source_type="none"인 섹션(서론, 결론 등)을 생성합니다.
+
+    검색 결과 없이 문서 맥락에 맞는 일반적인 내용을 작성합니다.
+
+    Args:
+        section_query: 섹션 질의
+        llm_client: 테스트용 mock 함수 (None이면 실제 Ollama API 호출)
+
+    Returns:
+        생성된 결과 딕셔너리
+    """
+    user_message = f"""섹션 요청: {section_query}
+
+위 요청에 맞는 내용을 작성해주세요.
+검색 결과가 필요 없는 일반적인 섹션(서론, 결론 등)입니다."""
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT_NONE},
+        {"role": "user", "content": user_message},
+    ]
+
+    # LLM 호출 (mock 또는 실제 API)
+    client = llm_client if llm_client is not None else _call_ollama
+    raw_output = client(messages)
+
+    # 응답 파싱
+    result = _parse_llm_response(raw_output, "none", 0)
+
+    # 언어 검증 (한글 비율 체크)
+    if not is_language_valid(result["answer"]):
+        result["has_fabrication_risk"] = True
+
+    return result
 
 
 def _parse_llm_response(
@@ -181,10 +246,14 @@ def generate_section_draft(
         }
 
     Note:
-        source_type이 "none"인 경우는 이 함수에서 다루지 않습니다.
-        해당 케이스는 호출부에서 LLM을 스킵하고 직접 구성해야 합니다.
+        source_type이 "none"이고 sources가 빈 리스트인 경우,
+        별도의 프롬프트로 LLM을 호출하여 서론/결론 등을 생성합니다.
     """
-    # 빈 sources면 LLM 호출 생략
+    # source_type이 "none"이고 sources가 비어있으면 별도 프롬프트로 LLM 호출
+    if source_type == "none" and not sources:
+        return _generate_none_section(section_query, llm_client)
+
+    # 빈 sources면 LLM 호출 생략 (internal/web인데 검색 결과가 없는 경우)
     if not sources:
         return {
             "answer": "",
