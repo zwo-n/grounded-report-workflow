@@ -22,28 +22,7 @@ from pipeline.web_search import search_web
 from pipeline.llm_writer import generate_section_draft
 from pipeline.router import route, Route
 from pipeline.docx_builder import create_document, add_section, save_document
-
-
-# 섹션 정의: (제목, 쿼리)
-# source_type은 classify_source_type으로 동적 분류
-SECTIONS = [
-    {
-        "title": "서론",
-        "query": "보고서 서론을 작성해주세요",
-    },
-    {
-        "title": "회사 기술 역량",
-        "query": "회사의 주요 기술 역량과 프로젝트 경험을 설명해주세요",
-    },
-    {
-        "title": "차별화 전략",
-        "query": "회사의 차별화 전략과 경쟁 우위를 설명해주세요",
-    },
-    {
-        "title": "시장 동향",
-        "query": "RAG 기반 문서 자동화 시장 동향을 설명해주세요",
-    },
-]
+from pipeline.section_planner import plan_sections
 
 
 def process_section(
@@ -141,28 +120,38 @@ def process_section(
 
 
 def run_pipeline(
+    user_request: str,
     output_path: str = "output.docx",
     llm_client: Callable[[list[dict]], str] | None = None,
     classifier_client: Callable[[list[dict]], str] | None = None,
+    planner_client: Callable[[list[dict]], str] | None = None,
 ) -> None:
     """
     전체 파이프라인을 실행합니다.
 
     Args:
+        user_request: 사용자 요청 (예: "클라우드 비용 최적화 제안서 작성해줘")
         output_path: 출력 파일 경로
         llm_client: LLM 클라이언트 (None이면 실제 Ollama API 호출)
         classifier_client: 분류용 LLM 클라이언트 (None이면 실제 Ollama API 호출)
+        planner_client: 섹션 계획용 LLM 클라이언트 (None이면 실제 Ollama API 호출)
     """
     print("=" * 60)
     print("Grounded Report Workflow 실행")
+    print(f"요청: {user_request}")
     print("=" * 60)
+
+    # 섹션 구성 동적 생성
+    print("\n[섹션 계획 생성 중...]")
+    sections = plan_sections(user_request, llm_client=planner_client)
+    print(f"생성된 섹션: {[s['title'] for s in sections]}")
 
     # 문서 생성
     doc = create_document()
     doc.add_heading("Grounded Report", level=1)
 
     # 섹션별 처리
-    for section in SECTIONS:
+    for section in sections:
         title = section["title"]
         print(f"\n[처리 중] {title}...")
 
@@ -188,4 +177,12 @@ def run_pipeline(
 
 
 if __name__ == "__main__":
-    run_pipeline()
+    import sys
+
+    # 명령줄 인자가 있으면 사용, 없으면 기본값
+    if len(sys.argv) > 1:
+        request = " ".join(sys.argv[1:])
+    else:
+        request = "RAG 기반 문서 자동화 기술 역량 보고서를 작성해줘"
+
+    run_pipeline(user_request=request)
