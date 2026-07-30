@@ -12,18 +12,49 @@ Tavily API를 사용하여 외부 웹에서 관련 정보를 검색합니다.
 - TAVILY_API_KEY: Tavily API 키
 - USE_MOCK_SEARCH: true면 API 호출 없이 mock 데이터 반환 (기본값: false)
 
+필터링:
+- score < MIN_SCORE_THRESHOLD 결과 제외
+- EXCLUDED_DOMAINS에 포함된 도메인 결과 제외
+
 Note: llm_writer.py에서 internal/web 결과를 동일한 코드로 처리하기 위해
 rag_tool.py와 필드명을 통일했습니다.
 """
 
 import os
 from typing import TypedDict
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from tavily import TavilyClient
 
 # .env 파일에서 환경변수 로드
 load_dotenv()
+
+# =============================================================================
+# 필터링 설정
+# =============================================================================
+
+# 최소 관련성 점수 (이 값 미만은 제외)
+MIN_SCORE_THRESHOLD = 0.4
+
+# 텍스트 근거로 부적합한 도메인 (SNS, 영상 플랫폼 등)
+EXCLUDED_DOMAINS = [
+    "youtube.com",
+    "youtu.be",
+    "tiktok.com",
+    "instagram.com",
+    "twitter.com",
+    "x.com",
+    "facebook.com",
+    "fb.com",
+    "reddit.com",
+    "pinterest.com",
+    "threads.net",
+]
+
+# =============================================================================
+# 내부 상태
+# =============================================================================
 
 # API 클라이언트 초기화 (lazy loading)
 _client: TavilyClient | None = None
@@ -44,6 +75,62 @@ def _get_client() -> TavilyClient | None:
         if api_key:
             _client = TavilyClient(api_key=api_key)
     return _client
+
+
+def _extract_domain(url: str) -> str:
+    """URL에서 도메인을 추출합니다."""
+    try:
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower()
+        # www. 접두사 제거
+        if domain.startswith("www."):
+            domain = domain[4:]
+        return domain
+    except Exception:
+        return ""
+
+
+def _is_excluded_domain(url: str) -> bool:
+    """URL이 제외 대상 도메인인지 확인합니다."""
+    domain = _extract_domain(url)
+    for excluded in EXCLUDED_DOMAINS:
+        if domain == excluded or domain.endswith("." + excluded):
+            return True
+    return False
+
+
+def _filter_results(
+    results: list[dict],
+) -> tuple[list[dict], dict[str, int]]:
+    """
+    검색 결과를 필터링합니다.
+
+    Args:
+        results: 원본 검색 결과
+
+    Returns:
+        (필터링된 결과, 필터링 통계)
+    """
+    filtered = []
+    stats = {"low_score": 0, "excluded_domain": 0}
+
+    for item in results:
+        score = item.get("score", 0.0)
+        url = item.get("source_url", "")
+
+        # score 임계값 체크
+        if score < MIN_SCORE_THRESHOLD:
+            stats["low_score"] += 1
+            continue
+
+        # 도메인 블록리스트 체크
+        if _is_excluded_domain(url):
+            stats["excluded_domain"] += 1
+            continue
+
+        filtered.append(item)
+
+    return filtered, stats
 
 
 def _get_mock_results(max_results: int) -> list[dict]:
@@ -107,6 +194,7 @@ def search_web(query: str, max_results: int = 5) -> SearchResponse:
     Note:
         - USE_MOCK_SEARCH=true면 API 호출 없이 mock 데이터 반환
         - search_depth="basic" 사용 (크레딧 절약)
+        - score < 0.4 또는 SNS/영상 도메인 결과는 필터링됨
         - 호출 실패 시 빈 결과 반환 (예외 발생 안 함)
     """
     global _call_count
@@ -125,25 +213,43 @@ def search_web(query: str, max_results: int = 5) -> SearchResponse:
         return {"results": []}
 
     try:
+        # API에는 max_results보다 여유있게 요청 (필터링 대비)
+        fetch_count = min(max_results + 5, 10)
         response = client.search(
             query=query,
-            max_results=max_results,
+            max_results=fetch_count,
             search_depth="basic",  # 크레딧 절약
             include_answer=False,
             include_raw_content=False,
         )
 
-        results: list[SearchResult] = []
+        # 원본 결과 변환
+        raw_results: list[SearchResult] = []
         for item in response.get("results", []):
-            results.append({
+            raw_results.append({
                 "content": item.get("content", ""),
                 "source_title": item.get("title", ""),
                 "source_url": item.get("url", ""),
                 "score": item.get("score", 0.0),
             })
 
-        print(f"[web_search] 결과 {len(results)}건 반환")
-        return {"results": results}
+        # 필터링 적용
+        filtered_results, stats = _filter_results(raw_results)
+
+        # 필터링 로그
+        total_filtered = stats["low_score"] + stats["excluded_domain"]
+        if total_filtered > 0:
+            reasons = []
+            if stats["low_score"] > 0:
+                reasons.append(f"score<{MIN_SCORE_THRESHOLD}: {stats['low_score']}건")
+            if stats["excluded_domain"] > 0:
+                reasons.append(f"제외도메인: {stats['excluded_domain']}건")
+            print(f"[web_search] {total_filtered}건 필터링됨 ({', '.join(reasons)})")
+
+        # max_results까지만 반환
+        final_results = filtered_results[:max_results]
+        print(f"[web_search] 결과 {len(final_results)}건 반환 (원본 {len(raw_results)}건)")
+        return {"results": final_results}
 
     except Exception as e:
         print(f"[web_search] ERROR: {type(e).__name__}: {e}")
