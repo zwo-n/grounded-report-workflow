@@ -2,26 +2,70 @@
 section_planner.py - 섹션 구성 동적 생성 모듈
 
 사용자 요청을 분석하여 보고서/제안서의 섹션 구성을 동적으로 생성합니다.
-단일 LLM 호출로 섹션 제목, 쿼리, 순서를 함께 결정합니다.
+단일 LLM 호출로 문서 유형 판단과 섹션 구성을 함께 결정합니다.
 
 사용 예:
-    # 순수 동적 생성
-    sections = plan_sections("클라우드 비용 최적화 제안서 작성해줘")
+    # 자동 감지 + 섹션 생성 (단일 LLM 호출)
+    sections, detected_hint = plan_sections("클라우드 비용 최적화 제안서 작성해줘")
 
-    # 템플릿 힌트 제공 (few-shot 예시로 활용)
-    sections = plan_sections("AWS 비용 절감 방안", template_hint="제안서")
+    # 템플릿 힌트 명시적 제공 (few-shot 예시로 활용)
+    sections, _ = plan_sections("AWS 비용 절감 방안", template_hint="제안서")
 """
 
 import json
 import requests
 from typing import Callable
 
-from pipeline.templates import get_template, format_template_as_example
+from pipeline.templates import (
+    get_template,
+    format_template_as_example,
+    format_templates_for_detection,
+    TEMPLATES,
+)
 
 OLLAMA_BASE_URL = "http://localhost:11434"
 MODEL_NAME = "qwen2.5:7b-instruct-q4_0"
 
-PLANNER_SYSTEM_PROMPT = """당신은 보고서/제안서 구성 전문가입니다.
+# 사용 가능한 템플릿 목록 (동적으로 생성)
+AVAILABLE_TEMPLATES = list(TEMPLATES.keys())
+
+# 템플릿 자동 감지 + 섹션 생성 통합 프롬프트
+PLANNER_SYSTEM_PROMPT_WITH_DETECTION = """당신은 보고서/제안서 구성 전문가입니다.
+
+## 1단계: 문서 유형 판단
+먼저 사용자 요청에 가장 적합한 문서 유형을 아래 목록에서 선택하세요.
+해당하는 유형이 없으면 null로 설정하세요.
+
+사용 가능한 문서 유형:
+{template_descriptions}
+
+## 2단계: 섹션 구성 생성
+판단한 문서 유형을 참고하여 적절한 섹션 구성을 생성하세요.
+
+섹션 구성 원칙:
+1. 서론으로 시작하고 결론으로 마무리
+2. 논리적 흐름에 따라 섹션 배치 (배경 → 현황 분석 → 제안/전략 → 기대효과)
+3. 각 섹션은 명확한 목적을 가져야 함
+4. 보통 4~7개 섹션이 적절함
+
+각 섹션에 대해:
+- title: 섹션 제목 (간결하게)
+- query: 해당 섹션을 작성하기 위한 구체적인 질의문
+- order: 섹션 순서 (1부터 시작)
+
+반드시 아래 JSON 형식으로만 응답하세요. 다른 텍스트는 포함하지 마세요.
+
+{{
+    "template_hint": "문서유형" 또는 null,
+    "sections": [
+        {{"title": "서론", "query": "보고서 서론을 작성해주세요", "order": 1}},
+        {{"title": "현황 분석", "query": "현재 상황을 분석해주세요", "order": 2}},
+        ...
+    ]
+}}"""
+
+# 템플릿 명시적 제공 시 사용하는 프롬프트
+PLANNER_SYSTEM_PROMPT_WITH_TEMPLATE = """당신은 보고서/제안서 구성 전문가입니다.
 
 사용자의 요청을 분석하여 적절한 섹션 구성을 생성하세요.
 
@@ -38,13 +82,13 @@ PLANNER_SYSTEM_PROMPT = """당신은 보고서/제안서 구성 전문가입니�
 
 반드시 아래 JSON 형식으로만 응답하세요. 다른 텍스트는 포함하지 마세요.
 
-{
+{{
     "sections": [
-        {"title": "서론", "query": "보고서 서론을 작성해주세요", "order": 1},
-        {"title": "현황 분석", "query": "현재 상황을 분석해주세요", "order": 2},
+        {{"title": "서론", "query": "보고서 서론을 작성해주세요", "order": 1}},
+        {{"title": "현황 분석", "query": "현재 상황을 분석해주세요", "order": 2}},
         ...
     ]
-}"""
+}}"""
 
 
 def _call_ollama_for_planning(messages: list[dict]) -> str:
@@ -72,15 +116,15 @@ def _call_ollama_for_planning(messages: list[dict]) -> str:
     return result.get("message", {}).get("content", "")
 
 
-def _parse_sections_response(raw_output: str) -> list[dict]:
+def _parse_plan_response(raw_output: str) -> tuple[list[dict], str | None]:
     """
-    LLM 응답을 파싱하여 섹션 리스트를 추출합니다.
+    LLM 응답을 파싱하여 섹션 리스트와 감지된 템플릿 힌트를 추출합니다.
 
     Args:
         raw_output: LLM의 원시 응답
 
     Returns:
-        섹션 리스트 [{"title": str, "query": str, "order": int}, ...]
+        (섹션 리스트, 감지된 template_hint 또는 None)
         파싱 실패 시 기본 섹션 구성 반환
     """
     default_sections = [
@@ -90,21 +134,26 @@ def _parse_sections_response(raw_output: str) -> list[dict]:
     ]
 
     if not raw_output or not raw_output.strip():
-        return default_sections
+        return default_sections, None
 
     try:
         result = json.loads(raw_output)
 
-        # "sections" 키가 있으면 해당 값 사용
+        # template_hint 추출
+        detected_hint = result.get("template_hint")
+        if detected_hint is not None and detected_hint not in AVAILABLE_TEMPLATES:
+            detected_hint = None
+
+        # sections 추출
         sections = result.get("sections", result)
 
         # 리스트가 아니면 폴백
         if not isinstance(sections, list):
-            return default_sections
+            return default_sections, detected_hint
 
         # 빈 리스트면 폴백
         if len(sections) == 0:
-            return default_sections
+            return default_sections, detected_hint
 
         # 각 섹션 검증 및 정규화
         validated_sections = []
@@ -128,43 +177,42 @@ def _parse_sections_response(raw_output: str) -> list[dict]:
 
         # 유효한 섹션이 없으면 폴백
         if len(validated_sections) == 0:
-            return default_sections
+            return default_sections, detected_hint
 
         # order 기준으로 정렬
         validated_sections.sort(key=lambda x: x["order"])
 
-        return validated_sections
+        return validated_sections, detected_hint
 
     except (json.JSONDecodeError, TypeError, ValueError):
-        return default_sections
+        return default_sections, None
 
 
 def plan_sections(
     user_request: str,
     template_hint: str | None = None,
     llm_client: Callable[[list[dict]], str] | None = None,
-) -> list[dict]:
+) -> tuple[list[dict], str | None]:
     """
     사용자 요청을 분석하여 섹션 구성을 생성합니다.
+
+    단일 LLM 호출로 문서 유형 판단과 섹션 구성을 함께 수행합니다.
+    template_hint가 명시적으로 제공되면 판단 단계를 건너뛰고 해당 템플릿을
+    few-shot 예시로 사용합니다.
 
     Args:
         user_request: 사용자 요청 (예: "클라우드 비용 최적화 제안서 작성해줘")
         template_hint: 문서 유형 힌트 (예: "제안서", "기술 보고서")
-                       제공 시 해당 유형의 섹션 구성을 few-shot 예시로 참고
+                       None이면 LLM이 자동 감지
         llm_client: 테스트용 mock 함수 (None이면 실제 Ollama API 호출)
 
     Returns:
-        섹션 리스트: [{"title": str, "query": str, "order": int}, ...]
-        order 기준 정렬되어 반환됨
+        (섹션 리스트, 감지된 template_hint)
+        - 섹션 리스트: [{"title": str, "query": str, "order": int}, ...]
+        - template_hint: 명시적 제공 시 해당 값, 자동 감지 시 감지된 값 또는 None
     """
-    # 기본 사용자 메시지
-    user_message = f"""사용자 요청: {user_request}
-
-위 요청에 맞는 보고서/제안서의 섹션 구성을 생성해주세요.
-각 섹션의 제목, 작성 질의문, 순서를 JSON 형식으로 응답하세요."""
-
-    # template_hint가 있으면 few-shot 예시 추가
-    if template_hint:
+    # Case 1: template_hint가 명시적으로 제공된 경우
+    if template_hint is not None:
         template = get_template(template_hint)
         if template:
             example_text = format_template_as_example(template)
@@ -179,14 +227,42 @@ def plan_sections(
 
 위 요청에 맞는 섹션 구성을 생성해주세요.
 각 섹션의 제목, 작성 질의문, 순서를 JSON 형식으로 응답하세요."""
+            applied_hint = template_hint
+        else:
+            # 알 수 없는 템플릿이면 기본 메시지 (few-shot 미적용)
+            user_message = f"""사용자 요청: {user_request}
+
+위 요청에 맞는 보고서/제안서의 섹션 구성을 생성해주세요.
+각 섹션의 제목, 작성 질의문, 순서를 JSON 형식으로 응답하세요."""
+            applied_hint = None  # 템플릿이 실제로 적용되지 않았으므로 None
+
+        messages = [
+            {"role": "system", "content": PLANNER_SYSTEM_PROMPT_WITH_TEMPLATE},
+            {"role": "user", "content": user_message},
+        ]
+
+        client = llm_client if llm_client is not None else _call_ollama_for_planning
+        raw_output = client(messages)
+
+        sections, _ = _parse_plan_response(raw_output)
+        return sections, applied_hint
+
+    # Case 2: template_hint가 None인 경우 - 자동 감지 + 섹션 생성 통합
+    template_descriptions = format_templates_for_detection()
+    system_prompt = PLANNER_SYSTEM_PROMPT_WITH_DETECTION.format(
+        template_descriptions=template_descriptions
+    )
+
+    user_message = f"""사용자 요청: {user_request}
+
+위 요청에 맞는 문서 유형을 판단하고, 적절한 섹션 구성을 생성해주세요."""
 
     messages = [
-        {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_message},
     ]
 
-    # LLM 호출 (mock 또는 실제 API)
     client = llm_client if llm_client is not None else _call_ollama_for_planning
     raw_output = client(messages)
 
-    return _parse_sections_response(raw_output)
+    return _parse_plan_response(raw_output)

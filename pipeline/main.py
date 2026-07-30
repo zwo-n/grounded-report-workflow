@@ -142,14 +142,16 @@ def run_pipeline(
     print("Grounded Report Workflow 실행")
     print(f"요청: {user_request}")
     if template_hint:
-        print(f"템플릿 힌트: {template_hint}")
+        print(f"지정된 템플릿: {template_hint}")
     print("=" * 60)
 
-    # 섹션 구성 동적 생성
+    # 섹션 구성 생성 (단일 LLM 호출로 문서 유형 감지 + 섹션 생성)
     print("\n[섹션 계획 생성 중...]")
-    sections = plan_sections(
+    sections, detected_hint = plan_sections(
         user_request, template_hint=template_hint, llm_client=planner_client
     )
+    if template_hint is None and detected_hint:
+        print(f"감지된 문서 유형: {detected_hint}")
     print(f"생성된 섹션: {[s['title'] for s in sections]}")
 
     # 문서 생성
@@ -174,6 +176,10 @@ def run_pipeline(
             print(f"[{title}] 분류: {classified_type} -> 최종: {final_source_type} -> {decision.label}")
         else:
             print(f"[{title}] -> {decision.label} ({final_source_type})")
+
+    # TODO: post-generation review hook
+    # 섹션 간 중복/모순 체크, 톤 일관성 검토 등을 추가할 자리.
+    # 아직 구현하지 않음 — 향후 별도 작업으로 진행 예정.
 
     # 문서 저장
     save_document(doc, output_path)

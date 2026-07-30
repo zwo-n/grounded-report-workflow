@@ -66,3 +66,17 @@ def format_template_as_example(template: dict) -> str:
         lines.append(f"  {section['order']}. {section['title']} - {section['query']}")
 
     return "\n".join(lines)
+
+
+def format_templates_for_detection() -> str:
+    """
+    모든 템플릿의 이름과 설명을 LLM 판단용 문자열로 변환합니다.
+
+    Returns:
+        포맷팅된 템플릿 목록 문자열
+    """
+    lines = []
+    for name, template in TEMPLATES.items():
+        description = template.get("description", "")
+        lines.append(f'- "{name}": {description}')
+    return "\n".join(lines)
