@@ -159,6 +159,17 @@ class TestHasChinese:
         """빈 문자열 - False"""
         assert has_chinese("") is False
 
+    def test_single_chinese_char_strict_zero_tolerance(self):
+        """중국어 1글자만 섞여도 True (0% 허용, 과거 10% 임계값이면 통과했을 저비율 케이스)"""
+        text = (
+            "회사는 다양한 기술 역량을 보유하고 있으며 자동화 시스템 구축에 "
+            "강점을 가지고 있습니다 关"
+        )
+        # 중국어 비율이 10% 미만인 저농도 케이스
+        assert check_korean_ratio(text) > 0  # 대부분 한글
+        assert has_chinese(text) is True
+        assert is_language_valid(text) is False
+
 
 class TestRealWorldCases:
     """실제 qwen 응답 패턴 테스트"""
