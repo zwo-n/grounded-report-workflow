@@ -1,5 +1,8 @@
 """
-lang_guard.py 유닛 테스트
+언어 검증 함수(check_korean_ratio, is_language_valid, has_chinese) 유닛 테스트
+
+원래 pipeline/lang_guard.py에 있던 함수들이 pipeline/llm_writer.py로
+통합되어, 이 테스트도 llm_writer에서 import한다.
 
 테스트 케이스:
 - 순수 한국어 (완결된 문장)
@@ -18,7 +21,7 @@ from pathlib import Path
 # 프로젝트 루트를 path에 추가
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from pipeline.lang_guard import check_korean_ratio, is_language_valid, has_chinese
+from pipeline.llm_writer import check_korean_ratio, is_language_valid, has_chinese
 
 
 class TestCheckKoreanRatio:

@@ -8,6 +8,7 @@ Ollama를 통해 qwen2.5:7b-instruct-q4_0 모델을 호출하여
 - Ollama API 호출 및 응답 파싱
 - 프롬프트 구성 및 전송
 - JSON 스키마 기반 구조화 출력
+- 응답 언어 검증 및 이탈 감지 시 재생성 (구 lang_guard.py, 이 파일로 통합됨)
 
 LLM 판단 영역:
 - 데이터 소스 선택
@@ -25,14 +26,112 @@ Note: 이 모듈에서 생성된 메타데이터는 router.py로 전달되어
 """
 
 import json
+import re
 import requests
 from typing import Callable
-
-from pipeline.lang_guard import is_language_valid
 
 
 OLLAMA_BASE_URL = "http://localhost:11434"
 MODEL_NAME = "qwen2.5:7b-instruct-q4_0"
+
+# 언어 이탈(중국어 등) 감지 시 재생성 시도 횟수 상한.
+# scripts/lang_guard_test.py 실측(source_type=none, N=30): 이탈률 23.3%.
+# 시도가 독립이라 가정하면 5회 연속 이탈 확률은 0.233^5 ≈ 0.07%로
+# 무한 루프 위험 없이 사실상 항상 정상 응답을 얻을 수 있는 수준.
+MAX_LANG_RETRY = 5
+
+
+def check_korean_ratio(text: str) -> float:
+    """
+    텍스트에서 한글 문자 비율을 계산합니다.
+
+    Args:
+        text: 검사할 텍스트
+
+    Returns:
+        한글 문자 비율 (0.0 ~ 1.0)
+        공백, 숫자, 특수문자를 제외한 문자 중 한글의 비율
+    """
+    if not text:
+        return 0.0
+
+    # 공백, 숫자, 특수문자, 구두점 제외 (실제 "글자"만 카운트)
+    # 한글: 가-힣 (완성형), ᄀ-ᇿ (자모)
+    # 영문, 중국어 등 다른 문자도 포함해서 전체 문자 수 계산
+    letters_only = re.sub(r'[\s\d\W]', '', text, flags=re.UNICODE)
+
+    if not letters_only:
+        return 0.0
+
+    # 한글 문자 카운트 (완성형 + 자모)
+    korean_pattern = re.compile(r'[가-힣ᄀ-ᇿ]')
+    korean_chars = korean_pattern.findall(letters_only)
+
+    return len(korean_chars) / len(letters_only)
+
+
+def has_chinese(text: str, threshold: float = 0.0) -> bool:
+    """
+    텍스트에 중국어가 threshold 비율을 초과하여 포함되어 있는지 확인합니다.
+
+    Args:
+        text: 검사할 텍스트
+        threshold: 중국어 비율 임계값 (기본값 0.0 = 0%, 중국어가 한 글자라도
+                   있으면 감지. 하네스 우회 시 즉시 차단하기 위한 fallback이므로
+                   허용 오차를 두지 않음)
+
+    Returns:
+        True: 중국어가 threshold를 초과하여 포함됨 (threshold=0.0이면 1글자라도 포함 시)
+        False: 중국어가 없음 (threshold 이하)
+    """
+    if not text:
+        return False
+
+    letters_only = re.sub(r'[\s\d\W]', '', text, flags=re.UNICODE)
+    if not letters_only:
+        return False
+
+    # 중국어 문자 범위 (CJK Unified Ideographs)
+    # 한자는 한국어에서도 쓰이지만, qwen 이탈 시 중국어 간체자가 주로 나옴
+    chinese_pattern = re.compile(r'[一-鿿]')
+    chinese_chars = chinese_pattern.findall(letters_only)
+
+    if not chinese_chars:
+        return False
+
+    return len(chinese_chars) / len(letters_only) > threshold
+
+
+def is_language_valid(text: str, min_korean_ratio: float = 0.5) -> bool:
+    """
+    텍스트가 유효한 한국어인지 검증합니다.
+
+    Args:
+        text: 검사할 텍스트
+        min_korean_ratio: 최소 한글 비율 (기본값 0.5 = 50%)
+                          기술 용어(AWS, Bedrock, LangGraph 등)가 많이 포함된
+                          정상적인 한국어 답변도 50% 이상을 유지함.
+                          중국어 이탈은 has_chinese()에서 별도로 감지.
+
+    Returns:
+        True: 유효한 한국어 (비율 충족 또는 빈 문자열)
+        False: 언어 이탈 (한글 비율 미달)
+
+    Note:
+        - 빈 문자열은 True를 반환합니다. (근거 없음 케이스)
+        - 중국어가 한 글자라도 포함되면 has_chinese()에서 먼저 차단됩니다.
+    """
+    # 빈 문자열은 정상 케이스 (근거 없음 = answer가 빈 값)
+    if not text or not text.strip():
+        return True
+
+    # 중국어가 한 글자라도 포함되면 언어 이탈로 판단 (0% 허용)
+    if has_chinese(text):
+        return False
+
+    ratio = check_korean_ratio(text)
+    return ratio >= min_korean_ratio
+
 
 SYSTEM_PROMPT = """당신은 보고서 작성을 돕는 AI 어시스턴트입니다.
 
@@ -194,18 +293,9 @@ def _generate_none_section(
         {"role": "user", "content": user_message},
     ]
 
-    # LLM 호출 (mock 또는 실제 API)
+    # LLM 호출 (mock 또는 실제 API), 언어 이탈 시 자동 재시도
     client = llm_client if llm_client is not None else _call_ollama
-    raw_output = client(messages)
-
-    # 응답 파싱
-    result = _parse_llm_response(raw_output, "none", 0)
-
-    # 언어 검증 (한글 비율 체크)
-    if not is_language_valid(result["answer"]):
-        result["has_fabrication_risk"] = True
-
-    return result
+    return _generate_with_lang_retry(messages, "none", 0, client)
 
 
 def _parse_llm_response(
@@ -242,6 +332,42 @@ def _parse_llm_response(
             "source_relevance": "low",
             "has_fabrication_risk": True,
         }
+
+
+def _generate_with_lang_retry(
+    messages: list[dict],
+    source_type: str,
+    source_count: int,
+    client: Callable[[list[dict]], str],
+    max_retries: int = MAX_LANG_RETRY,
+) -> dict:
+    """
+    언어 하네스(시스템 프롬프트)를 우회해 중국어 등으로 이탈한 응답이
+    감지되면 최대 max_retries회까지 재생성을 시도합니다.
+
+    마지막 시도까지 이탈이 지속되면 has_fabrication_risk=True로 표시해
+    검토 큐로 넘깁니다 (is_language_valid가 최종 안전망 역할).
+
+    Args:
+        messages: LLM에 전달할 대화 메시지 (system/user)
+        source_type: 출처 유형 (파싱 결과 기본값으로 사용)
+        source_count: 출처 개수 (파싱 결과 기본값으로 사용)
+        client: LLM 호출 함수 (mock 또는 _call_ollama)
+        max_retries: 최대 재시도 횟수
+
+    Returns:
+        파싱된 응답 딕셔너리 (마지막 시도 결과)
+    """
+    result: dict = {}
+    for _ in range(max_retries):
+        raw_output = client(messages)
+        result = _parse_llm_response(raw_output, source_type, source_count)
+        if is_language_valid(result["answer"]):
+            return result
+
+    # 재시도를 모두 소진했는데도 언어 이탈이면 검토 필요로 표시
+    result["has_fabrication_risk"] = True
+    return result
 
 
 def generate_section_draft(
@@ -302,15 +428,6 @@ def generate_section_draft(
         {"role": "user", "content": user_message},
     ]
 
-    # LLM 호출 (mock 또는 실제 API)
+    # LLM 호출 (mock 또는 실제 API), 언어 이탈 시 자동 재시도
     client = llm_client if llm_client is not None else _call_ollama
-    raw_output = client(messages)
-
-    # 응답 파싱
-    result = _parse_llm_response(raw_output, source_type, len(sources))
-
-    # 언어 검증 (한글 비율 체크)
-    if not is_language_valid(result["answer"]):
-        result["has_fabrication_risk"] = True
-
-    return result
+    return _generate_with_lang_retry(messages, source_type, len(sources), client)

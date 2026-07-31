@@ -62,13 +62,15 @@ pipeline/
 ├── main.py           # 파이프라인 조립 및 실행
 ├── rag_tool.py       # 사내 RAG 검색 (목업)
 ├── web_search.py     # 웹 검색 (목업)
-├── llm_writer.py     # Ollama LLM 호출 및 초안 생성
-├── lang_guard.py     # 응답 언어 검증 (한글 비율, 중국어 감지)
+├── llm_writer.py     # Ollama LLM 호출, 초안 생성, 응답 언어 검증(한글 비율/중국어 감지) 및 재시도
 ├── router.py         # 승인 라우팅 결정
 └── docx_builder.py   # Word 문서 생성
 
+scripts/
+└── lang_guard_test.py  # 중국어 이탈률 실측 스크립트
+
 tests/
-├── test_lang_guard.py
+├── test_lang_guard.py  # 언어 검증 함수 유닛 테스트 (llm_writer.py 대상)
 └── test_router.py
 ```
 
@@ -81,15 +83,15 @@ tests/
 | web | high/medium | false | 자동 승인 |
 | 그 외 | - | - | 검토 필요 |
 
-## 언어 검증 (하네스 + lang_guard)
+## 언어 검증 (하네스 + 재시도)
 
-qwen2.5 모델은 약 20% 확률로 한국어 응답 중 중국어로 전환되는 현상이 있습니다. 2단계로 방어합니다.
+qwen2.5 모델은 약 20% 확률로 한국어 응답 중 중국어로 전환되는 현상이 있습니다 (`scripts/lang_guard_test.py` 실측 이탈률 23.3%). `llm_writer.py`에서 2단계로 방어합니다.
 
-1. **프롬프트 하네스 (1차, 사전 제어)**: `llm_writer.py`의 시스템 프롬프트에 "반드시 한국어로만 응답" 규칙과 few-shot 예시를 명시하여, 모델이 처음부터 언어를 이탈하지 않도록 유도합니다.
-2. **lang_guard (2차, 사후 검증 fallback)**: 하네스를 우회한 잔여 케이스를 감지합니다.
+1. **프롬프트 하네스 (1차, 사전 제어)**: 시스템 프롬프트에 "반드시 한국어로만 응답" 규칙과 few-shot 예시를 명시하여, 모델이 처음부터 언어를 이탈하지 않도록 유도합니다.
+2. **언어 검증 + 재시도 (2차)**: `check_korean_ratio`/`has_chinese`/`is_language_valid` 함수로 응답을 검증하고, 이탈 시 `_generate_with_lang_retry()`가 최대 5회까지 자동 재생성합니다.
    - **한글 비율 체크**: 50% 이상 유지 (기술 용어 포함 시에도 통과)
-   - **중국어 감지**: 중국어가 한 글자라도 포함되면 즉시 차단 (0% 허용)
-   - 언어 이탈 감지 시 `has_fabrication_risk=True`로 설정되어 검토 필요로 라우팅
+   - **중국어 감지**: 중국어가 한 글자라도 포함되면 즉시 재시도 (0% 허용)
+   - 5회를 모두 소진해도 이탈이 지속되면 `has_fabrication_risk=True`로 설정되어 검토 필요로 라우팅 (실측 기준 5회 연속 실패 확률 ≈ 0.07%)
 
 ## 테스트 실행
 
