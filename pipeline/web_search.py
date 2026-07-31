@@ -1,7 +1,7 @@
 """
-web_search.py - 웹 검색 모듈
+web_search.py - 통합 웹 검색 모듈
 
-Tavily API를 사용하여 외부 웹에서 관련 정보를 검색합니다.
+Tavily API (해외/글로벌)와 Naver API (국내) 검색 결과를 통합합니다.
 사내 RAG에서 충분한 근거를 찾지 못했을 때 폴백으로 사용됩니다.
 
 요청/응답 계약 (rag_tool.py와 동일한 필드명 사용):
@@ -10,20 +10,26 @@ Tavily API를 사용하여 외부 웹에서 관련 정보를 검색합니다.
 
 환경변수:
 - TAVILY_API_KEY: Tavily API 키
+- NAVER_CLIENT_ID: NCP API Hub 클라이언트 ID
+- NAVER_CLIENT_SECRET: NCP API Hub 클라이언트 시크릿
 - USE_MOCK_SEARCH: true면 API 호출 없이 mock 데이터 반환 (기본값: false)
 
 필터링:
 - score < MIN_SCORE_THRESHOLD 결과 제외
 - EXCLUDED_DOMAINS에 포함된 도메인 결과 제외
 
-Note: llm_writer.py에서 internal/web 결과를 동일한 코드로 처리하기 위해
-rag_tool.py와 필드명을 통일했습니다.
+검색 전략:
+- search_tavily(): 해외 기술 동향, 글로벌 사례, 학술 자료
+- search_naver(): 국내 뉴스, 도입 사례, 시장 동향
+- search_web(): 둘 다 호출해서 통합 (기본)
 """
 
 import os
+import re
 from typing import TypedDict
 from urllib.parse import urlparse
 
+import requests
 from dotenv import load_dotenv
 from tavily import TavilyClient
 
@@ -52,13 +58,26 @@ EXCLUDED_DOMAINS = [
     "threads.net",
 ]
 
+# Naver 검색 전용 제외 도메인 (품질 편차 큼)
+NAVER_EXCLUDED_DOMAINS = EXCLUDED_DOMAINS + [
+    "blog.naver.com",
+    "cafe.naver.com",
+]
+
+# =============================================================================
+# API 설정
+# =============================================================================
+
+# NCP API Hub 엔드포인트
+NAVER_NEWS_SEARCH_URL = "https://naverapihub.apigw.ntruss.com/search/v1/news"
+
 # =============================================================================
 # 내부 상태
 # =============================================================================
 
-# API 클라이언트 초기화 (lazy loading)
-_client: TavilyClient | None = None
-_call_count: int = 0  # 세션 내 호출 횟수 카운터
+_tavily_client: TavilyClient | None = None
+_tavily_call_count: int = 0
+_naver_call_count: int = 0
 
 
 def _is_mock_mode() -> bool:
@@ -67,14 +86,9 @@ def _is_mock_mode() -> bool:
     return value in ("true", "1", "yes")
 
 
-def _get_client() -> TavilyClient | None:
-    """Tavily 클라이언트를 반환합니다. API 키가 없으면 None."""
-    global _client
-    if _client is None:
-        api_key = os.getenv("TAVILY_API_KEY", "").strip().strip('"')
-        if api_key:
-            _client = TavilyClient(api_key=api_key)
-    return _client
+# =============================================================================
+# 공통 유틸리티
+# =============================================================================
 
 
 def _extract_domain(url: str) -> str:
@@ -82,7 +96,6 @@ def _extract_domain(url: str) -> str:
     try:
         parsed = urlparse(url)
         domain = parsed.netloc.lower()
-        # www. 접두사 제거
         if domain.startswith("www."):
             domain = domain[4:]
         return domain
@@ -90,83 +103,29 @@ def _extract_domain(url: str) -> str:
         return ""
 
 
-def _is_excluded_domain(url: str) -> bool:
+def _is_excluded_domain(url: str, excluded_list: list[str]) -> bool:
     """URL이 제외 대상 도메인인지 확인합니다."""
     domain = _extract_domain(url)
-    for excluded in EXCLUDED_DOMAINS:
+    for excluded in excluded_list:
         if domain == excluded or domain.endswith("." + excluded):
             return True
     return False
 
 
-def _filter_results(
-    results: list[dict],
-) -> tuple[list[dict], dict[str, int]]:
-    """
-    검색 결과를 필터링합니다.
-
-    Args:
-        results: 원본 검색 결과
-
-    Returns:
-        (필터링된 결과, 필터링 통계)
-    """
-    filtered = []
-    stats = {"low_score": 0, "excluded_domain": 0}
-
-    for item in results:
-        score = item.get("score", 0.0)
-        url = item.get("source_url", "")
-
-        # score 임계값 체크
-        if score < MIN_SCORE_THRESHOLD:
-            stats["low_score"] += 1
-            continue
-
-        # 도메인 블록리스트 체크
-        if _is_excluded_domain(url):
-            stats["excluded_domain"] += 1
-            continue
-
-        filtered.append(item)
-
-    return filtered, stats
+def _clean_html(text: str) -> str:
+    """HTML 태그를 제거합니다."""
+    clean = re.sub(r"<[^>]+>", "", text)
+    clean = clean.replace("&quot;", '"')
+    clean = clean.replace("&amp;", "&")
+    clean = clean.replace("&lt;", "<")
+    clean = clean.replace("&gt;", ">")
+    clean = clean.replace("&nbsp;", " ")
+    return clean.strip()
 
 
-def _get_mock_results(max_results: int) -> list[dict]:
-    """Mock 데이터를 반환합니다."""
-    mock_data: list[dict] = [
-        {
-            "content": (
-                "국내 RAG 기반 문서 자동화 시장이 급성장하고 있다. "
-                "금융·물류·제조 업계를 중심으로 LLM과 사내 문서를 연동한 자동 리포트 생성 솔루션 도입이 확산되며, "
-                "2024년 시장 규모는 전년 대비 2배 이상 성장한 것으로 추정된다."
-            ),
-            "source_title": "RAG 문서 자동화 시장 동향 - AI타임스",
-            "source_url": "https://mock-news.example.com/rag-market-trend-2024",
-            "score": 0.85,
-        },
-        {
-            "content": (
-                "주요 SaaS 기업들이 실시간 문서 연동 기능을 고도화하고 있다. "
-                "A사는 Confluence·Notion 실시간 동기화를, B사는 SharePoint 양방향 연동을 출시하며 "
-                "기업용 지식 관리 시장 경쟁이 심화되고 있다."
-            ),
-            "source_title": "SaaS 문서 연동 경쟁 심화 - 테크뉴스",
-            "source_url": "https://mock-news.example.com/saas-document-sync-competition",
-            "score": 0.79,
-        },
-        {
-            "content": (
-                "전문가들은 RAG 기반 문서 자동화의 핵심 과제로 '환각(hallucination) 방지'를 꼽는다. "
-                "검색 결과 외 내용을 생성하지 않도록 출처 검증 파이프라인을 필수로 구축해야 한다는 의견이 지배적이다."
-            ),
-            "source_title": "RAG 환각 방지 전략 - AI인사이트",
-            "source_url": "https://mock-news.example.com/rag-hallucination-prevention",
-            "score": 0.72,
-        },
-    ]
-    return mock_data[:max_results]
+# =============================================================================
+# 타입 정의
+# =============================================================================
 
 
 class SearchResult(TypedDict):
@@ -180,50 +139,106 @@ class SearchResponse(TypedDict):
     results: list[SearchResult]
 
 
-def search_web(query: str, max_results: int = 5) -> SearchResponse:
+# =============================================================================
+# Tavily 검색 (해외/글로벌)
+# =============================================================================
+
+
+def _get_tavily_client() -> TavilyClient | None:
+    """Tavily 클라이언트를 반환합니다. API 키가 없으면 None."""
+    global _tavily_client
+    if _tavily_client is None:
+        api_key = os.getenv("TAVILY_API_KEY", "").strip().strip('"')
+        if api_key:
+            _tavily_client = TavilyClient(api_key=api_key)
+    return _tavily_client
+
+
+def _filter_tavily_results(
+    results: list[dict],
+) -> tuple[list[dict], dict[str, int]]:
+    """Tavily 검색 결과를 필터링합니다."""
+    filtered = []
+    stats = {"low_score": 0, "excluded_domain": 0}
+
+    for item in results:
+        score = item.get("score", 0.0)
+        url = item.get("source_url", "")
+
+        if score < MIN_SCORE_THRESHOLD:
+            stats["low_score"] += 1
+            continue
+
+        if _is_excluded_domain(url, EXCLUDED_DOMAINS):
+            stats["excluded_domain"] += 1
+            continue
+
+        filtered.append(item)
+
+    return filtered, stats
+
+
+def _get_tavily_mock_results(max_results: int) -> list[SearchResult]:
+    """Tavily Mock 데이터를 반환합니다."""
+    mock_data: list[SearchResult] = [
+        {
+            "content": (
+                "Enterprise RAG adoption is accelerating globally. "
+                "Financial services and manufacturing sectors lead in deploying "
+                "LLM-based document automation solutions."
+            ),
+            "source_title": "Enterprise RAG Market Trends 2024 - TechInsights",
+            "source_url": "https://mock-news.example.com/rag-market-trend-2024",
+            "score": 0.85,
+        },
+        {
+            "content": (
+                "Major SaaS companies are enhancing real-time document integration. "
+                "Confluence and Notion sync features are becoming standard."
+            ),
+            "source_title": "SaaS Document Integration - TechNews",
+            "source_url": "https://mock-news.example.com/saas-document-sync",
+            "score": 0.79,
+        },
+    ]
+    return mock_data[:max_results]
+
+
+def search_tavily(query: str, max_results: int = 5) -> SearchResponse:
     """
-    웹에서 관련 정보를 검색합니다.
+    Tavily API로 해외/글로벌 웹 검색을 수행합니다.
 
     Args:
-        query: 검색 쿼리
+        query: 검색 쿼리 (영어 권장)
         max_results: 반환할 최대 결과 수
 
     Returns:
-        SearchResponse: {"results": [{"content", "source_title", "source_url", "score"}]}
-
-    Note:
-        - USE_MOCK_SEARCH=true면 API 호출 없이 mock 데이터 반환
-        - search_depth="basic" 사용 (크레딧 절약)
-        - score < 0.4 또는 SNS/영상 도메인 결과는 필터링됨
-        - 호출 실패 시 빈 결과 반환 (예외 발생 안 함)
+        SearchResponse: {"results": [...]}
     """
-    global _call_count
-    _call_count += 1
+    global _tavily_call_count
+    _tavily_call_count += 1
 
-    # Mock 모드 체크
     if _is_mock_mode():
-        print(f"[web_search] MOCK 모드로 동작 중 (호출 #{_call_count}): {query[:50]}...")
-        return {"results": _get_mock_results(max_results)}
+        print(f"[tavily] MOCK 모드 (호출 #{_tavily_call_count}): {query[:50]}...")
+        return {"results": _get_tavily_mock_results(max_results)}
 
-    print(f"[web_search] 호출 #{_call_count}: {query[:50]}...")
+    print(f"[tavily] 호출 #{_tavily_call_count}: {query[:50]}...")
 
-    client = _get_client()
+    client = _get_tavily_client()
     if client is None:
-        print("[web_search] ERROR: TAVILY_API_KEY가 설정되지 않음")
+        print("[tavily] ERROR: TAVILY_API_KEY가 설정되지 않음")
         return {"results": []}
 
     try:
-        # API에는 max_results보다 여유있게 요청 (필터링 대비)
         fetch_count = min(max_results + 5, 10)
         response = client.search(
             query=query,
             max_results=fetch_count,
-            search_depth="basic",  # 크레딧 절약
+            search_depth="basic",
             include_answer=False,
             include_raw_content=False,
         )
 
-        # 원본 결과 변환
         raw_results: list[SearchResult] = []
         for item in response.get("results", []):
             raw_results.append({
@@ -233,10 +248,8 @@ def search_web(query: str, max_results: int = 5) -> SearchResponse:
                 "score": item.get("score", 0.0),
             })
 
-        # 필터링 적용
-        filtered_results, stats = _filter_results(raw_results)
+        filtered_results, stats = _filter_tavily_results(raw_results)
 
-        # 필터링 로그
         total_filtered = stats["low_score"] + stats["excluded_domain"]
         if total_filtered > 0:
             reasons = []
@@ -244,13 +257,233 @@ def search_web(query: str, max_results: int = 5) -> SearchResponse:
                 reasons.append(f"score<{MIN_SCORE_THRESHOLD}: {stats['low_score']}건")
             if stats["excluded_domain"] > 0:
                 reasons.append(f"제외도메인: {stats['excluded_domain']}건")
-            print(f"[web_search] {total_filtered}건 필터링됨 ({', '.join(reasons)})")
+            print(f"[tavily] {total_filtered}건 필터링됨 ({', '.join(reasons)})")
 
-        # max_results까지만 반환
         final_results = filtered_results[:max_results]
-        print(f"[web_search] 결과 {len(final_results)}건 반환 (원본 {len(raw_results)}건)")
+        print(f"[tavily] 결과 {len(final_results)}건 반환")
         return {"results": final_results}
 
     except Exception as e:
-        print(f"[web_search] ERROR: {type(e).__name__}: {e}")
+        print(f"[tavily] ERROR: {type(e).__name__}: {e}")
         return {"results": []}
+
+
+# =============================================================================
+# Naver 검색 (국내)
+# =============================================================================
+
+
+def _get_naver_credentials() -> tuple[str, str] | None:
+    """네이버 API 인증 정보를 반환합니다."""
+    client_id = os.getenv("NAVER_CLIENT_ID", "").strip().strip('"')
+    client_secret = os.getenv("NAVER_CLIENT_SECRET", "").strip().strip('"')
+    if client_id and client_secret:
+        return (client_id, client_secret)
+    return None
+
+
+def _calculate_naver_score(rank: int, total: int) -> float:
+    """순위 기반 점수를 계산합니다 (1위: 1.0, 마지막: 0.5)."""
+    if total <= 1:
+        return 1.0
+    return 1.0 - (0.5 * (rank - 1) / (total - 1))
+
+
+def _get_naver_mock_results(max_results: int) -> list[SearchResult]:
+    """Naver Mock 데이터를 반환합니다."""
+    mock_data: list[SearchResult] = [
+        {
+            "content": (
+                "국내 주요 기업들이 RAG 기반 문서 자동화 솔루션 도입을 확대하고 있다. "
+                "금융·제조·물류 업계를 중심으로 LLM 기반 보고서 생성 시스템 구축이 활발히 진행 중이다."
+            ),
+            "source_title": "국내 기업 RAG 도입 현황 - AI타임스",
+            "source_url": "https://mock-news.example.com/korea-rag-adoption",
+            "score": 1.0,
+        },
+        {
+            "content": (
+                "그리드원이 국내형 Agentic Automation 플랫폼 전략을 발표했다. "
+                "AI Agent, RPA, RAG 기능을 통합한 GO;DO 플랫폼으로 기업 업무 자동화 시장 공략에 나선다."
+            ),
+            "source_title": "그리드원, 엔터프라이즈 AI 플랫폼 전략 발표",
+            "source_url": "https://mock-news.example.com/gridone-platform",
+            "score": 0.9,
+        },
+    ]
+    return mock_data[:max_results]
+
+
+def search_naver(query: str, max_results: int = 5) -> SearchResponse:
+    """
+    NCP API Hub로 네이버 뉴스 검색을 수행합니다.
+
+    Args:
+        query: 검색 쿼리 (한국어)
+        max_results: 반환할 최대 결과 수
+
+    Returns:
+        SearchResponse: {"results": [...]}
+    """
+    global _naver_call_count
+    _naver_call_count += 1
+
+    if _is_mock_mode():
+        print(f"[naver] MOCK 모드 (호출 #{_naver_call_count}): {query[:50]}...")
+        return {"results": _get_naver_mock_results(max_results)}
+
+    print(f"[naver] 호출 #{_naver_call_count}: {query[:50]}...")
+
+    credentials = _get_naver_credentials()
+    if credentials is None:
+        print("[naver] ERROR: NAVER_CLIENT_ID/SECRET이 설정되지 않음")
+        return {"results": []}
+
+    client_id, client_secret = credentials
+
+    try:
+        fetch_count = min(max_results + 5, 10)
+
+        headers = {
+            "X-NCP-APIGW-API-KEY-ID": client_id,
+            "X-NCP-APIGW-API-KEY": client_secret,
+        }
+
+        params = {
+            "query": query,
+            "display": fetch_count,
+            "start": 1,
+            "sort": "sim",
+        }
+
+        response = requests.get(
+            NAVER_NEWS_SEARCH_URL,
+            headers=headers,
+            params=params,
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        items = data.get("items", [])
+        raw_results: list[SearchResult] = []
+        excluded_count = 0
+
+        for rank, item in enumerate(items, 1):
+            url = item.get("link", "")
+
+            if _is_excluded_domain(url, NAVER_EXCLUDED_DOMAINS):
+                excluded_count += 1
+                continue
+
+            raw_results.append({
+                "content": _clean_html(item.get("description", "")),
+                "source_title": _clean_html(item.get("title", "")),
+                "source_url": url,
+                "score": _calculate_naver_score(rank, len(items)),
+            })
+
+        if excluded_count > 0:
+            print(f"[naver] {excluded_count}건 필터링됨 (제외도메인)")
+
+        final_results = raw_results[:max_results]
+        print(f"[naver] 결과 {len(final_results)}건 반환")
+        return {"results": final_results}
+
+    except requests.exceptions.RequestException as e:
+        print(f"[naver] ERROR: 요청 실패 - {type(e).__name__}: {e}")
+        return {"results": []}
+    except Exception as e:
+        print(f"[naver] ERROR: {type(e).__name__}: {e}")
+        return {"results": []}
+
+
+# =============================================================================
+# 통합 검색 (Tavily + Naver)
+# =============================================================================
+
+
+def search_web(
+    query: str,
+    query_global: str | None = None,
+    max_results: int = 5,
+) -> SearchResponse:
+    """
+    Tavily (해외)와 Naver (국내) 검색 결과를 통합합니다.
+
+    Args:
+        query: 검색 쿼리 (한국어, Naver 검색에 사용)
+        query_global: 영어 쿼리 (Tavily 검색에 사용, None이면 query 그대로 사용)
+        max_results: 반환할 최대 결과 수 (각 소스별 max_results/2 + 1)
+
+    Returns:
+        SearchResponse: {"results": [...]} - 통합된 검색 결과
+
+    Note:
+        - Tavily 결과에는 [글로벌] 태그 추가
+        - Naver 결과에는 [국내] 태그 추가
+        - score 기준 내림차순 정렬
+    """
+    print(f"[search_web] 통합 검색 시작: {query[:50]}...")
+
+    # 각 소스별 결과 수 계산
+    per_source = max(max_results // 2 + 1, 2)
+
+    # Tavily 검색 (해외)
+    tavily_query = query_global if query_global else query
+    tavily_results = search_tavily(tavily_query, max_results=per_source)
+
+    # Naver 검색 (국내)
+    naver_results = search_naver(query, max_results=per_source)
+
+    # 결과 통합
+    combined: list[SearchResult] = []
+
+    for item in tavily_results["results"]:
+        combined.append({
+            "content": item["content"],
+            "source_title": f"[글로벌] {item['source_title']}",
+            "source_url": item["source_url"],
+            "score": item["score"],
+        })
+
+    for item in naver_results["results"]:
+        combined.append({
+            "content": item["content"],
+            "source_title": f"[국내] {item['source_title']}",
+            "source_url": item["source_url"],
+            "score": item["score"],
+        })
+
+    # score 기준 정렬
+    combined.sort(key=lambda x: x["score"], reverse=True)
+
+    # max_results까지만 반환
+    final_results = combined[:max_results]
+
+    print(
+        f"[search_web] 통합 완료: Tavily {len(tavily_results['results'])}건 + "
+        f"Naver {len(naver_results['results'])}건 → {len(final_results)}건"
+    )
+
+    return {"results": final_results}
+
+
+# =============================================================================
+# 호출 횟수 관리
+# =============================================================================
+
+
+def get_call_counts() -> dict[str, int]:
+    """각 API별 호출 횟수를 반환합니다."""
+    return {
+        "tavily": _tavily_call_count,
+        "naver": _naver_call_count,
+    }
+
+
+def reset_call_counts() -> None:
+    """호출 횟수 카운터를 초기화합니다."""
+    global _tavily_call_count, _naver_call_count
+    _tavily_call_count = 0
+    _naver_call_count = 0
