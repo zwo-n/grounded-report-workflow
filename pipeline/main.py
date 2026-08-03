@@ -21,7 +21,17 @@ from pipeline.rag_tool import search_internal_knowledge
 from pipeline.web_search import search_web
 from pipeline.llm_writer import generate_section_draft
 from pipeline.router import route, Route
-from pipeline.docx_builder import create_document, add_section, save_document
+from pipeline.docx_builder import (
+    create_document,
+    build_cover_page,
+    build_toc_page,
+    start_body_content,
+    add_section,
+    add_references_section,
+    collect_references,
+    save_document,
+    TOC_THRESHOLD,
+)
 from pipeline.section_planner import plan_sections
 
 
@@ -145,20 +155,44 @@ def run_pipeline(
         print(f"지정된 템플릿: {template_hint}")
     print("=" * 60)
 
-    # 섹션 구성 생성 (단일 LLM 호출로 문서 유형 감지 + 섹션 생성)
+    # 섹션 구성 생성 (단일 LLM 호출로 문서 제목 + 유형 감지 + 섹션 생성)
     print("\n[섹션 계획 생성 중...]")
-    sections, detected_hint = plan_sections(
+    sections, document_title, detected_hint = plan_sections(
         user_request, template_hint=template_hint, llm_client=planner_client
     )
+    if document_title:
+        print(f"문서 제목: {document_title}")
+    if document_title:
+        print(f"문서 제목: {document_title}")
     if template_hint is None and detected_hint:
         print(f"감지된 문서 유형: {detected_hint}")
     print(f"생성된 섹션: {[s['title'] for s in sections]}")
 
-    # 문서 생성
-    doc = create_document()
-    doc.add_heading("Grounded Report", level=1)
+    # 문서 제목 fallback
+    if not document_title:
+        document_title = user_request
+        for suffix in ["를 작성해줘", "을 작성해줘", "작성해줘", "해줘", "해주세요"]:
+            if document_title.endswith(suffix):
+                document_title = document_title[:-len(suffix)].strip()
+                break
 
-    # 섹션별 처리
+    # 문서 생성 (새로운 페이지 구조)
+    doc = create_document()  # 빈 문서 (스타일만 적용)
+
+    # 페이지 1: 표지
+    build_cover_page(doc, title=document_title)
+
+    # 페이지 2: 목차 (섹션 수가 충분하면)
+    include_toc = len(sections) >= TOC_THRESHOLD
+    if include_toc:
+        build_toc_page(doc, sections=sections)
+
+    # 페이지 3+: 본문 시작
+    start_body_content(doc)
+
+    # 섹션별 처리 (출처 수집)
+    all_sources = []
+
     for section in sections:
         title = section["title"]
         print(f"\n[처리 중] {title}...")
@@ -167,8 +201,12 @@ def run_pipeline(
             section, llm_client, classifier_client
         )
 
-        # 문서에 섹션 추가
-        add_section(doc, title, llm_result, decision, sources)
+        # 출처 수집 (참고 자료 섹션용)
+        if sources:
+            all_sources.append(sources)
+
+        # 문서에 섹션 추가 (인라인 출처 표시 안 함)
+        add_section(doc, title, llm_result, decision, sources, include_inline_sources=False)
 
         # 진행 상황 출력
         final_source_type = llm_result.get("source_type", "unknown")
@@ -177,9 +215,11 @@ def run_pipeline(
         else:
             print(f"[{title}] -> {decision.label} ({final_source_type})")
 
-    # TODO: post-generation review hook
-    # 섹션 간 중복/모순 체크, 톤 일관성 검토 등을 추가할 자리.
-    # 아직 구현하지 않음 — 향후 별도 작업으로 진행 예정.
+    # 참고 자료 섹션 추가 (모든 출처 통합)
+    unique_sources = collect_references(all_sources)
+    if unique_sources:
+        add_references_section(doc, unique_sources)
+        print(f"\n[참고 자료] {len(unique_sources)}건 추가됨")
 
     # 문서 저장
     save_document(doc, output_path)

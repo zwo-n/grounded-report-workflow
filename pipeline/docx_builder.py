@@ -29,6 +29,264 @@ from pipeline.router import Route
 
 
 # =============================================================================
+# 마크다운 인라인 파싱
+# =============================================================================
+def parse_inline_markdown(text: str) -> list[tuple[str, bool, bool]]:
+    """
+    마크다운 인라인 서식(볼드, 이탤릭)을 파싱합니다.
+
+    Args:
+        text: 원본 텍스트
+
+    Returns:
+        [(텍스트, bold여부, italic여부), ...] 리스트
+    """
+    if not text:
+        return []
+
+    result = []
+    # **bold**, *italic*, ***bold+italic*** 패턴 처리
+    # 패턴 우선순위: *** > ** > *
+    pattern = re.compile(r'(\*\*\*(.+?)\*\*\*|\*\*(.+?)\*\*|\*(.+?)\*)')
+
+    last_end = 0
+    for match in pattern.finditer(text):
+        # 매치 전 일반 텍스트
+        if match.start() > last_end:
+            result.append((text[last_end:match.start()], False, False))
+
+        full_match = match.group(0)
+        if full_match.startswith('***'):
+            # bold + italic
+            content = match.group(2)
+            result.append((content, True, True))
+        elif full_match.startswith('**'):
+            # bold only
+            content = match.group(3)
+            result.append((content, True, False))
+        else:
+            # italic only
+            content = match.group(4)
+            result.append((content, False, True))
+
+        last_end = match.end()
+
+    # 남은 텍스트
+    if last_end < len(text):
+        result.append((text[last_end:], False, False))
+
+    return result
+
+
+def _add_formatted_text(paragraph, text: str) -> None:
+    """
+    마크다운 인라인 서식이 적용된 텍스트를 문단에 추가합니다.
+
+    Args:
+        paragraph: python-docx Paragraph 객체
+        text: 마크다운 서식이 포함된 텍스트
+    """
+    segments = parse_inline_markdown(text)
+
+    for content, is_bold, is_italic in segments:
+        run = paragraph.add_run(content)
+        # 폰트 먼저 설정
+        _set_korean_font(run)
+        run.font.size = DEFAULT_FONT_SIZE
+        run.font.color.rgb = COLOR_TEXT_GRAY
+        # bold/italic은 반드시 마지막에 설정 (덮어쓰기 방지)
+        if is_bold:
+            run.font.bold = True
+        if is_italic:
+            run.font.italic = True
+
+
+# =============================================================================
+# 하이퍼링크 헬퍼
+# =============================================================================
+def add_hyperlink(paragraph, url: str, text: str, color: RGBColor | None = None) -> None:
+    """
+    문단에 클릭 가능한 하이퍼링크를 추가합니다.
+
+    Args:
+        paragraph: python-docx Paragraph 객체
+        url: 링크 URL
+        text: 표시할 텍스트
+        color: 링크 색상 (None이면 기본 파란색)
+    """
+    # 파트에서 relationship 생성
+    part = paragraph.part
+    r_id = part.relate_to(url, "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink", is_external=True)
+
+    # w:hyperlink 요소 생성
+    hyperlink = OxmlElement('w:hyperlink')
+    hyperlink.set(qn('r:id'), r_id)
+
+    # w:r (run) 요소 생성
+    new_run = OxmlElement('w:r')
+    rPr = OxmlElement('w:rPr')
+
+    # 링크 스타일 (파란색 + 밑줄)
+    c = OxmlElement('w:color')
+    if color:
+        c.set(qn('w:val'), f'{color.red:02X}{color.green:02X}{color.blue:02X}')
+    else:
+        c.set(qn('w:val'), '0563C1')  # 기본 링크 파란색
+    rPr.append(c)
+
+    u = OxmlElement('w:u')
+    u.set(qn('w:val'), 'single')
+    rPr.append(u)
+
+    # 폰트 설정
+    rFonts = OxmlElement('w:rFonts')
+    rFonts.set(qn('w:eastAsia'), DEFAULT_FONT_NAME)
+    rFonts.set(qn('w:ascii'), DEFAULT_FONT_NAME)
+    rFonts.set(qn('w:hAnsi'), DEFAULT_FONT_NAME)
+    rPr.append(rFonts)
+
+    sz = OxmlElement('w:sz')
+    sz.set(qn('w:val'), '20')  # 10pt
+    rPr.append(sz)
+
+    new_run.append(rPr)
+
+    # 텍스트 추가
+    t = OxmlElement('w:t')
+    t.text = text
+    new_run.append(t)
+
+    hyperlink.append(new_run)
+    paragraph._p.append(hyperlink)
+
+
+# =============================================================================
+# 번호 매기기 리스트 (독립 numId)
+# =============================================================================
+def _get_fresh_numbering_id(doc: Document) -> int:
+    """
+    문서에서 새로운 독립적인 numbering ID를 생성합니다.
+    각 번호 리스트가 1번부터 시작하도록 합니다.
+
+    Args:
+        doc: python-docx Document 객체
+
+    Returns:
+        새로운 numId
+    """
+    # numbering.xml 파트 가져오기
+    numbering_part = doc.part.numbering_part
+
+    if numbering_part is None:
+        # numbering 파트가 없으면 생성 (첫 번째 리스트 추가 시 자동 생성됨)
+        temp_para = doc.add_paragraph("temp", style='List Number')
+        doc._body._element.remove(temp_para._element)
+        numbering_part = doc.part.numbering_part
+
+    numbering_xml = numbering_part._element
+
+    # 기존 abstractNum 찾기 (List Number 스타일용)
+    # namespace 없이 직접 접근
+    abstract_num_id = "0"
+    for child in numbering_xml:
+        if child.tag.endswith('abstractNum'):
+            # abstractNumId 속성 가져오기 (namespace 포함된 키로)
+            for key in child.attrib:
+                if key.endswith('abstractNumId'):
+                    abstract_num_id = child.attrib[key]
+                    break
+            if abstract_num_id != "0":
+                break
+
+    # 기존 num 요소들의 최대 numId 찾기
+    max_num_id = 0
+    for child in numbering_xml:
+        if child.tag.endswith('num'):
+            for key in child.attrib:
+                if key.endswith('numId'):
+                    try:
+                        num_id_val = int(child.attrib[key])
+                        max_num_id = max(max_num_id, num_id_val)
+                    except ValueError:
+                        pass
+                    break
+
+    # 새로운 numId 생성 (기존 최대값 + 1)
+    new_num_id = max_num_id + 1
+
+    # 새로운 num 요소 생성
+    num = OxmlElement('w:num')
+    num.set(qn('w:numId'), str(new_num_id))
+
+    abstract_num_id_elem = OxmlElement('w:abstractNumId')
+    abstract_num_id_elem.set(qn('w:val'), abstract_num_id)
+    num.append(abstract_num_id_elem)
+
+    # lvlOverride로 시작 번호 1로 강제 설정
+    lvl_override = OxmlElement('w:lvlOverride')
+    lvl_override.set(qn('w:ilvl'), '0')
+
+    start_override = OxmlElement('w:startOverride')
+    start_override.set(qn('w:val'), '1')
+    lvl_override.append(start_override)
+
+    num.append(lvl_override)
+
+    # numbering.xml에 추가
+    numbering_xml.append(num)
+
+    return new_num_id
+
+
+def _add_numbered_list_fresh(doc: Document, items: list[str]) -> None:
+    """
+    1번부터 시작하는 독립적인 번호 리스트를 추가합니다.
+
+    Args:
+        doc: python-docx Document 객체
+        items: 리스트 아이템 문자열 리스트
+    """
+    if not items:
+        return
+
+    # 새로운 numId 발급
+    num_id = _get_fresh_numbering_id(doc)
+
+    for item in items:
+        para = doc.add_paragraph()
+        para.style = doc.styles['List Number']
+        para.paragraph_format.space_after = Pt(4)
+
+        # numId 재설정
+        pPr = para._element.get_or_add_pPr()
+        numPr = pPr.find(qn('w:numPr'))
+        if numPr is None:
+            numPr = OxmlElement('w:numPr')
+            pPr.append(numPr)
+
+        # 기존 numId 제거 후 새 numId 설정
+        existing_numId = numPr.find(qn('w:numId'))
+        if existing_numId is not None:
+            numPr.remove(existing_numId)
+
+        numId_elem = OxmlElement('w:numId')
+        numId_elem.set(qn('w:val'), str(num_id))
+        numPr.append(numId_elem)
+
+        # ilvl 설정 (레벨 0)
+        existing_ilvl = numPr.find(qn('w:ilvl'))
+        if existing_ilvl is not None:
+            numPr.remove(existing_ilvl)
+
+        ilvl_elem = OxmlElement('w:ilvl')
+        ilvl_elem.set(qn('w:val'), '0')
+        numPr.insert(0, ilvl_elem)
+
+        # 마크다운 서식 적용하여 텍스트 추가
+        _add_formatted_text(para, item)
+
+
+# =============================================================================
 # 기본 로고 경로
 # =============================================================================
 DEFAULT_LOGO_PATH = Path(__file__).parent.parent / "assets" / "gambalabs-logo.png"
@@ -217,7 +475,7 @@ def add_document_header(
     date: str | None = None,
 ) -> None:
     """
-    문서 공식 레이아웃(로고, 제목, 메타데이터, 구분선)을 추가합니다.
+    문서 공식 레이아웃(로고, 제목, 메타데이터)을 추가합니다.
 
     Args:
         doc: python-docx Document 객체
@@ -245,8 +503,314 @@ def add_document_header(
     # 3. 메타데이터 블록 (작성자, 작성일)
     _add_metadata_block(doc, author, date)
 
-    # 4. 구분선
-    _add_separator_line(doc)
+
+# =============================================================================
+# 페이지 구조 함수 (표지, 목차, 참고자료)
+# =============================================================================
+def build_cover_page(
+    doc: Document,
+    title: str,
+    logo_path: str | Path | None = None,
+    author: str | None = None,
+    date: str | None = None,
+) -> None:
+    """
+    표지 페이지를 생성합니다 (1페이지).
+    로고, 제목, 작성자/작성일을 포함합니다.
+
+    Args:
+        doc: python-docx Document 객체
+        title: 문서 제목
+        logo_path: 로고 이미지 경로 (None이면 기본 로고)
+        author: 작성자 (None이면 플레이스홀더)
+        date: 작성일 (None이면 플레이스홀더)
+    """
+    # 1. 로고 삽입 (헤더 영역, 좌상단)
+    _add_header_with_logo(doc, logo_path)
+
+    # 2. 여백 추가 (상단 여백)
+    for _ in range(3):
+        doc.add_paragraph()
+
+    # 3. 제목 (대형, 중앙 정렬)
+    title_para = doc.add_paragraph()
+    title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    title_para.paragraph_format.space_before = Pt(0)
+    title_para.paragraph_format.space_after = Pt(24)
+
+    title_run = title_para.add_run(title)
+    title_run.font.size = Pt(28)
+    title_run.font.bold = True
+    title_run.font.color.rgb = COLOR_PRIMARY_DARK
+    _set_korean_font(title_run)
+
+    # 4. 여백 추가
+    for _ in range(4):
+        doc.add_paragraph()
+
+    # 5. 메타데이터 (중앙 정렬)
+    author_text = author if author else "[작성자]"
+    date_text = date if date else "[작성일]"
+    metadata_text = f"작성자: {author_text}    |    작성일: {date_text}"
+
+    meta_para = doc.add_paragraph()
+    meta_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    meta_para.paragraph_format.space_before = Pt(0)
+    meta_para.paragraph_format.space_after = Pt(8)
+
+    meta_run = meta_para.add_run(metadata_text)
+    meta_run.font.size = Pt(11)
+    meta_run.font.color.rgb = COLOR_TEXT_MUTED
+    _set_korean_font(meta_run)
+
+
+def build_toc_page(doc: Document, sections: list[dict] | None = None) -> None:
+    """
+    목차 페이지를 생성합니다 (2페이지).
+    Word TOC 필드를 삽입하여 Word에서 업데이트하면 자동으로 페이지 번호가 채워집니다.
+
+    Args:
+        doc: python-docx Document 객체
+        sections: 섹션 목록 (정적 목차 미리보기용, None이면 동적 TOC만)
+    """
+    # 페이지 브레이크
+    doc.add_page_break()
+
+    # "목차" 제목
+    toc_title = doc.add_paragraph()
+    toc_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    toc_title.paragraph_format.space_before = Pt(24)
+    toc_title.paragraph_format.space_after = Pt(18)
+
+    toc_run = toc_title.add_run("목차")
+    toc_run.font.size = Pt(18)
+    toc_run.font.bold = True
+    toc_run.font.color.rgb = COLOR_PRIMARY
+    _set_korean_font(toc_run)
+
+    # Word TOC 필드 삽입 (업데이트하면 점선+페이지번호 자동 생성)
+    _add_toc_with_preview(doc, sections)
+
+    # 목차 후 여백
+    doc.add_paragraph()
+
+
+def _add_toc_with_preview(doc: Document, sections: list[dict] | None = None) -> None:
+    """
+    TOC 필드와 미리보기 텍스트를 함께 삽입합니다.
+    Word에서 필드 업데이트 전까지 미리보기 텍스트가 표시됩니다.
+
+    Args:
+        doc: python-docx Document 객체
+        sections: 미리보기용 섹션 목록
+    """
+    paragraph = doc.add_paragraph()
+    run = paragraph.add_run()
+
+    # TOC 필드 시작
+    fldChar_begin = OxmlElement('w:fldChar')
+    fldChar_begin.set(qn('w:fldCharType'), 'begin')
+
+    instrText = OxmlElement('w:instrText')
+    instrText.set(qn('xml:space'), 'preserve')
+    # \o "1-3": Heading 1~3 포함, \h: 하이퍼링크, \z: 탭리더 숨김 해제, \u: 단락 서식 사용
+    instrText.text = 'TOC \\o "1-3" \\h \\z \\u'
+
+    fldChar_separate = OxmlElement('w:fldChar')
+    fldChar_separate.set(qn('w:fldCharType'), 'separate')
+
+    r_element = run._r
+    r_element.append(fldChar_begin)
+    r_element.append(instrText)
+    r_element.append(fldChar_separate)
+
+    # 미리보기 텍스트 (섹션 목록이 있으면 표시)
+    # 표지(1p) + 목차(2p) 이후 본문은 3페이지부터 시작
+    if sections:
+        start_page = 3
+        for i, section in enumerate(sections, 1):
+            title = section.get("title", f"섹션 {i}")
+            preview_para = doc.add_paragraph()
+            # 예상 페이지 번호 (실제로는 Word에서 필드 업데이트 필요)
+            estimated_page = str(start_page + i - 1)
+            _add_toc_entry_with_dots(preview_para, f"{i}. {title}", estimated_page)
+
+        # 참고 자료 항목
+        ref_para = doc.add_paragraph()
+        ref_page = str(start_page + len(sections))
+        _add_toc_entry_with_dots(ref_para, f"{len(sections) + 1}. 참고 자료", ref_page)
+
+        # 안내 문구
+        note_para = doc.add_paragraph()
+        note_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        note_run = note_para.add_run("(Word에서 목차를 우클릭하여 '필드 업데이트'를 선택하면 페이지 번호가 표시됩니다)")
+        note_run.font.size = Pt(9)
+        note_run.font.italic = True
+        note_run.font.color.rgb = COLOR_TEXT_MUTED
+        _set_korean_font(note_run)
+
+    # TOC 필드 종료
+    end_para = doc.add_paragraph()
+    end_run = end_para.add_run()
+    fldChar_end = OxmlElement('w:fldChar')
+    fldChar_end.set(qn('w:fldCharType'), 'end')
+    end_run._r.append(fldChar_end)
+
+
+def _add_toc_entry_with_dots(paragraph, title: str, page_num: str) -> None:
+    """
+    점 리더와 페이지 번호가 있는 목차 항목을 추가합니다.
+
+    Args:
+        paragraph: python-docx Paragraph 객체
+        title: 섹션 제목
+        page_num: 페이지 번호 (빈 문자열이면 생략)
+    """
+    # 탭 스톱 설정 (우측 정렬, 점 리더)
+    pPr = paragraph._element.get_or_add_pPr()
+    tabs = OxmlElement('w:tabs')
+    tab = OxmlElement('w:tab')
+    tab.set(qn('w:val'), 'right')
+    tab.set(qn('w:leader'), 'dot')
+    tab.set(qn('w:pos'), '9360')  # 6.5인치 (우측 여백)
+    tabs.append(tab)
+    pPr.append(tabs)
+
+    paragraph.paragraph_format.space_before = Pt(4)
+    paragraph.paragraph_format.space_after = Pt(4)
+    paragraph.paragraph_format.left_indent = Inches(0.3)
+
+    # 제목
+    title_run = paragraph.add_run(title)
+    title_run.font.size = Pt(11)
+    title_run.font.color.rgb = COLOR_PRIMARY_DARK
+    _set_korean_font(title_run)
+
+    # 탭 + 페이지 번호
+    if page_num:
+        tab_run = paragraph.add_run('\t')
+        page_run = paragraph.add_run(page_num)
+        page_run.font.size = Pt(11)
+        page_run.font.color.rgb = COLOR_TEXT_MUTED
+        _set_korean_font(page_run)
+
+
+def start_body_content(doc: Document) -> None:
+    """
+    본문 시작 페이지로 이동합니다 (3페이지부터).
+    페이지 브레이크를 추가합니다.
+
+    Args:
+        doc: python-docx Document 객체
+    """
+    doc.add_page_break()
+
+
+def collect_references(all_sources: list[list[dict]]) -> list[dict]:
+    """
+    모든 섹션의 출처를 수집하고 중복을 제거합니다.
+
+    Args:
+        all_sources: 섹션별 출처 리스트의 리스트
+
+    Returns:
+        중복 제거된 출처 리스트
+    """
+    seen_urls = set()
+    unique_sources = []
+
+    for sources in all_sources:
+        for source in sources:
+            url = source.get("source_url", "")
+            title = source.get("source_title", "")
+
+            # URL 기준으로 중복 체크 (URL 없으면 제목 기준)
+            key = url if url else title
+            if key and key not in seen_urls:
+                seen_urls.add(key)
+                unique_sources.append(source)
+
+    return unique_sources
+
+
+def add_references_section(doc: Document, sources: list[dict]) -> None:
+    """
+    참고 자료 섹션을 문서 끝에 추가합니다.
+    URL은 클릭 가능한 하이퍼링크로 표시됩니다.
+
+    Args:
+        doc: python-docx Document 객체
+        sources: 출처 리스트 (collect_references 결과)
+    """
+    if not sources:
+        return
+
+    # "참고 자료" 섹션 제목 (Heading 2)
+    heading = doc.add_heading("참고 자료", level=2)
+    style_config = HEADING_STYLES[2]
+
+    heading.paragraph_format.space_before = Pt(24)
+    heading.paragraph_format.space_after = style_config["space_after"]
+
+    for run in heading.runs:
+        run.font.size = style_config["size"]
+        run.font.bold = style_config["bold"]
+        run.font.color.rgb = style_config["color"]
+        _set_korean_font(run)
+
+    # 출처 목록 (독립적인 번호 리스트 - 1번부터 시작)
+    num_id = _get_fresh_numbering_id(doc)
+
+    for i, source in enumerate(sources, 1):
+        title = source.get("source_title", "출처")
+        url = source.get("source_url", "")
+
+        para = doc.add_paragraph()
+        para.style = doc.styles['List Number']
+        para.paragraph_format.space_after = Pt(6)
+
+        # numId 재설정 (독립적인 번호 매기기)
+        pPr = para._element.get_or_add_pPr()
+        numPr = pPr.find(qn('w:numPr'))
+        if numPr is None:
+            numPr = OxmlElement('w:numPr')
+            pPr.append(numPr)
+
+        existing_numId = numPr.find(qn('w:numId'))
+        if existing_numId is not None:
+            numPr.remove(existing_numId)
+
+        numId_elem = OxmlElement('w:numId')
+        numId_elem.set(qn('w:val'), str(num_id))
+        numPr.append(numId_elem)
+
+        existing_ilvl = numPr.find(qn('w:ilvl'))
+        if existing_ilvl is not None:
+            numPr.remove(existing_ilvl)
+
+        ilvl_elem = OxmlElement('w:ilvl')
+        ilvl_elem.set(qn('w:val'), '0')
+        numPr.insert(0, ilvl_elem)
+
+        # 제목 추가
+        title_run = para.add_run(title)
+        title_run.font.size = Pt(10)
+        title_run.font.color.rgb = COLOR_TEXT_GRAY
+        _set_korean_font(title_run)
+
+        # URL이 있으면 줄바꿈 후 하이퍼링크 추가
+        if url:
+            # 내부 문서(rag://...)는 하이퍼링크 없이 일반 텍스트로
+            if url.startswith("rag://") or url.startswith("internal/"):
+                para.add_run("\n   ")
+                url_run = para.add_run(url)
+                url_run.font.size = Pt(9)
+                url_run.font.color.rgb = COLOR_TEXT_MUTED
+                _set_korean_font(url_run)
+            else:
+                # 외부 URL은 클릭 가능한 하이퍼링크로
+                para.add_run("\n   ")
+                add_hyperlink(para, url, url)
 
 
 def _set_paragraph_shading(paragraph, fill_color: str) -> None:
@@ -475,18 +1039,17 @@ def _count_heading2(doc: Document) -> int:
 def _add_bullet_list(doc: Document, items: list[str]) -> None:
     """
     실제 bullet 리스트를 문서에 추가합니다.
+    **볼드**, *이탤릭* 등 인라인 마크다운 서식도 적용됩니다.
 
     Args:
         doc: python-docx Document 객체
         items: 리스트 아이템 문자열 리스트
     """
     for item in items:
-        para = doc.add_paragraph(item, style='List Bullet')
+        para = doc.add_paragraph(style='List Bullet')
         para.paragraph_format.space_after = Pt(4)
-        for run in para.runs:
-            run.font.size = DEFAULT_FONT_SIZE
-            run.font.color.rgb = COLOR_TEXT_GRAY
-            _set_korean_font(run)
+        # 마크다운 인라인 서식 적용
+        _add_formatted_text(para, item)
 
 
 def _add_numbered_list(doc: Document, items: list[str]) -> None:
@@ -762,6 +1325,7 @@ def _add_structured_content(doc: Document, text: str) -> None:
     """
     구조화된 콘텐츠를 문서에 추가합니다.
     마크다운 표, 리스트, 일반 문단을 렌더링합니다.
+    **볼드**, *이탤릭* 등 인라인 마크다운 서식도 적용됩니다.
 
     Args:
         doc: python-docx Document 객체
@@ -771,16 +1335,15 @@ def _add_structured_content(doc: Document, text: str) -> None:
 
     for item in structures:
         if item["type"] == "paragraph":
-            para = doc.add_paragraph(item["content"])
+            para = doc.add_paragraph()
             _apply_body_paragraph_format(para)
-            for run in para.runs:
-                run.font.size = DEFAULT_FONT_SIZE
-                run.font.color.rgb = COLOR_TEXT_GRAY
-                _set_korean_font(run)
+            # 마크다운 인라인 서식 적용
+            _add_formatted_text(para, item["content"])
         elif item["type"] == "bullet_list":
             _add_bullet_list(doc, item["items"])
         elif item["type"] == "numbered_list":
-            _add_numbered_list(doc, item["items"])
+            # 독립적인 번호 매기기 (1번부터 시작)
+            _add_numbered_list_fresh(doc, item["items"])
         elif item["type"] == "table":
             # 마크다운 표 렌더링
             _add_table_with_header(doc, item["headers"], item["rows"])
@@ -856,6 +1419,7 @@ def add_section(
     llm_result: dict,
     decision: Route,
     sources: list[dict],
+    include_inline_sources: bool = False,
 ) -> None:
     """
     문서에 섹션을 추가합니다.
@@ -866,6 +1430,7 @@ def add_section(
         llm_result: LLM 응답 결과
         decision: 라우팅 결과
         sources: 검색 결과 리스트
+        include_inline_sources: 섹션 내 인라인 출처 표시 여부 (기본: False)
     """
     # 섹션 제목 (Heading 2) - 브랜드 스타일 적용
     heading = doc.add_heading(section_title, level=2)
@@ -884,7 +1449,7 @@ def add_section(
     source_type = llm_result.get("source_type", "none")
 
     if decision == Route.AUTO_APPROVE:
-        _add_approved_section(doc, answer, source_type, sources)
+        _add_approved_section(doc, answer, source_type, sources, include_inline_sources)
     else:
         _add_review_section(doc, answer, llm_result.get("source_count", 0), decision)
 
@@ -894,6 +1459,7 @@ def _add_approved_section(
     answer: str,
     source_type: str,
     sources: list[dict],
+    include_inline_sources: bool = False,
 ) -> None:
     """
     자동 승인된 섹션을 추가합니다.
@@ -903,9 +1469,14 @@ def _add_approved_section(
         answer: LLM 생성 답변
         source_type: 출처 유형
         sources: 검색 결과 리스트
+        include_inline_sources: 인라인 출처 표시 여부
     """
     if answer:
         _add_structured_content(doc, answer)
+
+    # 인라인 출처 추가 (옵션)
+    if not include_inline_sources:
+        return
 
     # 출처 추가 (브랜드 Accent 색상 적용)
     if source_type == "internal":
@@ -1011,9 +1582,13 @@ def create_document(
     """
     새 Document 객체를 생성합니다.
 
+    권장: 새로운 페이지 구조를 사용하려면 이 함수 대신
+    create_document() + build_cover_page() + build_toc_page() + start_body_content()
+    조합을 사용하세요.
+
     Args:
-        title: 문서 제목 (None이면 제목 없음)
-        include_toc: 목차 포함 여부
+        title: 문서 제목 (None이면 표지 없음)
+        include_toc: 목차 포함 여부 (True면 build_toc_page() 자동 호출)
         logo_path: 로고 이미지 경로 (None이면 기본 로고 사용, False면 로고 없음)
         author: 작성자 (None이면 플레이스홀더 표시)
         date: 작성일 (None이면 플레이스홀더 표시)
@@ -1046,22 +1621,17 @@ def create_document(
             if pBdr is not None:
                 pPr.remove(pBdr)
 
-    # 공식 문서 헤더 추가 (로고, 제목, 메타데이터, 구분선)
+    # 표지 페이지 생성
     if title:
-        add_document_header(doc, title, logo_path, author, date)
+        build_cover_page(doc, title, logo_path, author, date)
 
+    # 목차 페이지 생성
     if include_toc:
-        toc_title = doc.add_paragraph("목차")
-        toc_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        toc_title.paragraph_format.space_before = Pt(12)
-        toc_title.paragraph_format.space_after = Pt(6)
-        for run in toc_title.runs:
-            run.bold = True
-            run.font.size = Pt(16)
-            run.font.color.rgb = COLOR_PRIMARY
-            _set_korean_font(run)
-        _add_toc(doc)
-        doc.add_paragraph()
+        build_toc_page(doc)
+
+    # 본문 시작 (표지나 목차가 있으면 페이지 브레이크)
+    if title or include_toc:
+        start_body_content(doc)
 
     return doc
 
@@ -1102,19 +1672,18 @@ def build_document(
     save_document(doc, output_path)
 
 
-def save_document(doc: Document, filepath: str, auto_toc: bool = True) -> None:
+def save_document(doc: Document, filepath: str) -> None:
     """
     Document를 파일로 저장합니다.
 
     Args:
         doc: Document 객체
         filepath: 저장 경로
-        auto_toc: 자동 목차 삽입 여부
     """
-    if auto_toc:
-        heading2_count = _count_heading2(doc)
-        if heading2_count >= TOC_THRESHOLD:
-            _insert_toc_after_title(doc)
+    # 디렉토리가 없으면 생성
+    output_dir = Path(filepath).parent
+    if output_dir and not output_dir.exists():
+        output_dir.mkdir(parents=True, exist_ok=True)
 
     doc.save(filepath)
 
