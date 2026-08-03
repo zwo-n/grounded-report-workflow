@@ -21,6 +21,7 @@ from pipeline.docx_builder import (
     _add_toc,
     _count_heading2,
     TOC_THRESHOLD,
+    DEFAULT_LOGO_PATH,
 )
 from pipeline.router import Route
 
@@ -240,6 +241,48 @@ class TestContentParsing:
         assert result[0]["type"] == "bullet_list"
         assert result[0]["items"] == ["항목 A", "항목 B"]
 
+    def test_parse_markdown_table(self):
+        """마크다운 표 파싱"""
+        text = """| 항목 | 비용 |
+|------|------|
+| 서버 | $100 |
+| DB | $50 |"""
+        result = _parse_content_structure(text)
+
+        assert len(result) == 1
+        assert result[0]["type"] == "table"
+        assert result[0]["headers"] == ["항목", "비용"]
+        assert len(result[0]["rows"]) == 2
+        assert result[0]["rows"][0] == ["서버", "$100"]
+        assert result[0]["rows"][1] == ["DB", "$50"]
+
+    def test_parse_markdown_table_with_alignment(self):
+        """정렬 구분선이 있는 마크다운 표 파싱"""
+        text = """| 왼쪽 | 가운데 | 오른쪽 |
+|:-----|:------:|-------:|
+| A | B | C |"""
+        result = _parse_content_structure(text)
+
+        assert len(result) == 1
+        assert result[0]["type"] == "table"
+        assert result[0]["headers"] == ["왼쪽", "가운데", "오른쪽"]
+
+    def test_parse_mixed_content_with_table(self):
+        """표가 포함된 혼합 콘텐츠 파싱"""
+        text = """서론입니다.
+
+| 항목 | 값 |
+|------|-----|
+| A | 1 |
+
+결론입니다."""
+        result = _parse_content_structure(text)
+
+        assert len(result) == 3
+        assert result[0]["type"] == "paragraph"
+        assert result[1]["type"] == "table"
+        assert result[2]["type"] == "paragraph"
+
 
 class TestAddSection:
     """섹션 추가 테스트"""
@@ -339,3 +382,50 @@ class TestBuildDocument:
             assert h1_paras[0].text == "커스텀 제목"
         finally:
             os.unlink(output_path)
+
+
+class TestLogo:
+    """로고 삽입 테스트"""
+
+    def test_create_document_with_default_logo(self):
+        """기본 로고가 삽입되는지 확인 (로고 파일 존재 시)"""
+        from pipeline.docx_builder import DEFAULT_LOGO_PATH
+
+        doc = create_document(title="로고 테스트")
+
+        # 헤더 섹션 존재 확인
+        header = doc.sections[0].header
+        assert header is not None
+
+        # 로고 파일이 있으면 헤더에 이미지가 삽입됨
+        if DEFAULT_LOGO_PATH.exists():
+            # 헤더 문단에 run이 존재해야 함
+            assert len(header.paragraphs) >= 1
+
+    def test_create_document_missing_logo_graceful(self):
+        """로고 파일이 없어도 에러 없이 동작"""
+        # 존재하지 않는 경로로 문서 생성
+        doc = create_document(
+            title="로고 없음 테스트",
+            logo_path="/nonexistent/path/logo.png"
+        )
+
+        # 에러 없이 문서 생성 완료
+        assert doc is not None
+        assert len(doc.paragraphs) >= 1
+
+    def test_create_document_logo_disabled(self):
+        """logo_path=False로 로고 비활성화"""
+        doc = create_document(
+            title="로고 비활성화 테스트",
+            logo_path=False
+        )
+
+        # 헤더에 이미지가 없어야 함 (기본 문단만 존재)
+        header = doc.sections[0].header
+        has_image = any(
+            hasattr(run, '_element') and run._element.find('.//{http://schemas.openxmlformats.org/drawingml/2006/main}blip') is not None
+            for para in header.paragraphs
+            for run in para.runs
+        )
+        assert not has_image

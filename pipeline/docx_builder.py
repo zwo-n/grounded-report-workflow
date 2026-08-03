@@ -13,6 +13,10 @@ docx_builder.py - Word 문서 생성 모듈
 - Gamba Labs 브랜드 스타일 적용
 """
 
+import os
+import re
+from pathlib import Path
+
 from docx import Document
 from docx.shared import Pt, RGBColor, Inches, Twips
 from docx.oxml.ns import qn, nsmap
@@ -22,6 +26,12 @@ from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.table import Table
 
 from pipeline.router import Route
+
+
+# =============================================================================
+# 기본 로고 경로
+# =============================================================================
+DEFAULT_LOGO_PATH = Path(__file__).parent.parent / "assets" / "gambalabs-logo.png"
 
 
 # =============================================================================
@@ -109,6 +119,134 @@ def _set_style_korean_font(style, font_name: str = DEFAULT_FONT_NAME) -> None:
     rFonts.set(qn('w:eastAsia'), font_name)
     rFonts.set(qn('w:ascii'), font_name)
     rFonts.set(qn('w:hAnsi'), font_name)
+
+
+# =============================================================================
+# 헤더/로고 관련 함수
+# =============================================================================
+def _add_header_with_logo(doc: Document, logo_path: str | Path | None = None) -> bool:
+    """
+    문서 헤더에 로고 이미지를 좌상단에 삽입합니다.
+
+    Args:
+        doc: python-docx Document 객체
+        logo_path: 로고 이미지 경로 (None이면 기본 경로 사용)
+
+    Returns:
+        로고 삽입 성공 여부
+    """
+    if logo_path is None:
+        logo_path = DEFAULT_LOGO_PATH
+
+    logo_path = Path(logo_path)
+
+    if not logo_path.exists():
+        print(f"[경고] 로고 파일을 찾을 수 없습니다: {logo_path}")
+        return False
+
+    # 첫 번째 섹션의 헤더 가져오기
+    section = doc.sections[0]
+    header = section.header
+
+    # 헤더 문단에 로고 삽입 (좌상단 정렬)
+    header_para = header.paragraphs[0] if header.paragraphs else header.add_paragraph()
+    header_para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+
+    run = header_para.add_run()
+    # 로고 크기: 너비 1.5인치 (높이는 비율 유지)
+    run.add_picture(str(logo_path), width=Inches(1.5))
+
+    return True
+
+
+def _add_metadata_block(
+    doc: Document,
+    author: str | None = None,
+    date: str | None = None,
+) -> None:
+    """
+    제목 아래 메타데이터 블록(작성자, 작성일)을 추가합니다.
+
+    Args:
+        doc: python-docx Document 객체
+        author: 작성자 (None이면 플레이스홀더)
+        date: 작성일 (None이면 플레이스홀더)
+    """
+    # 값이 없으면 명시적 플레이스홀더 사용 (임의 추정 금지)
+    author_text = author if author else "[작성자]"
+    date_text = date if date else "[작성일]"
+
+    metadata_text = f"작성자: {author_text}    |    작성일: {date_text}"
+
+    para = doc.add_paragraph()
+    para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    para.paragraph_format.space_before = Pt(4)
+    para.paragraph_format.space_after = Pt(8)
+
+    run = para.add_run(metadata_text)
+    run.font.size = Pt(10)
+    run.font.color.rgb = RGBColor(0x66, 0x66, 0x66)  # #666666
+    _set_korean_font(run)
+
+
+def _add_separator_line(doc: Document) -> None:
+    """
+    구분선(하단 테두리가 있는 빈 문단)을 추가합니다.
+    """
+    para = doc.add_paragraph()
+    para.paragraph_format.space_before = Pt(0)
+    para.paragraph_format.space_after = Pt(12)
+
+    # 하단 테두리만 추가 (연회색 실선)
+    pPr = para._element.get_or_add_pPr()
+    pBdr = OxmlElement('w:pBdr')
+    bottom = OxmlElement('w:bottom')
+    bottom.set(qn('w:val'), 'single')
+    bottom.set(qn('w:sz'), '6')  # 0.75pt
+    bottom.set(qn('w:space'), '1')
+    bottom.set(qn('w:color'), 'CCCCCC')  # 연회색
+    pBdr.append(bottom)
+    pPr.append(pBdr)
+
+
+def add_document_header(
+    doc: Document,
+    title: str,
+    logo_path: str | Path | None = None,
+    author: str | None = None,
+    date: str | None = None,
+) -> None:
+    """
+    문서 공식 레이아웃(로고, 제목, 메타데이터, 구분선)을 추가합니다.
+
+    Args:
+        doc: python-docx Document 객체
+        title: 문서 제목
+        logo_path: 로고 이미지 경로 (None이면 기본 로고, False면 로고 없음)
+        author: 작성자 (None이면 플레이스홀더)
+        date: 작성일 (None이면 플레이스홀더)
+    """
+    # 1. 로고 삽입 (헤더 영역)
+    if logo_path is not False:
+        _add_header_with_logo(doc, logo_path)
+
+    # 2. 제목 (Heading 1)
+    heading = doc.add_heading(title, level=1)
+    style_config = HEADING_STYLES[1]
+    heading.paragraph_format.space_before = Pt(0)
+    heading.paragraph_format.space_after = style_config["space_after"]
+
+    for run in heading.runs:
+        run.font.size = style_config["size"]
+        run.font.bold = style_config["bold"]
+        run.font.color.rgb = style_config["color"]
+        _set_korean_font(run)
+
+    # 3. 메타데이터 블록 (작성자, 작성일)
+    _add_metadata_block(doc, author, date)
+
+    # 4. 구분선
+    _add_separator_line(doc)
 
 
 def _set_paragraph_shading(paragraph, fill_color: str) -> None:
@@ -433,11 +571,102 @@ def _add_table_with_header(
 
 
 # =============================================================================
+# 마크다운 표 파싱
+# =============================================================================
+def _is_table_separator(line: str) -> bool:
+    """마크다운 표 구분선인지 확인합니다."""
+    stripped = line.strip()
+    if not stripped.startswith('|') or not stripped.endswith('|'):
+        return False
+    # |---|---| 또는 |:---|:---:| 형태
+    inner = stripped[1:-1]
+    cells = inner.split('|')
+    for cell in cells:
+        cell = cell.strip()
+        # 구분선 셀: -만 포함하거나 :- -: :-: 형태
+        if not re.match(r'^:?-+:?$', cell):
+            return False
+    return True
+
+
+def _parse_table_row(line: str) -> list[str]:
+    """마크다운 표 행을 파싱하여 셀 리스트를 반환합니다."""
+    stripped = line.strip()
+    if stripped.startswith('|'):
+        stripped = stripped[1:]
+    if stripped.endswith('|'):
+        stripped = stripped[:-1]
+    cells = [cell.strip() for cell in stripped.split('|')]
+    return cells
+
+
+def _parse_markdown_table(lines: list[str], start_idx: int) -> tuple[dict | None, int]:
+    """
+    마크다운 표를 파싱합니다.
+
+    Args:
+        lines: 전체 라인 리스트
+        start_idx: 시작 인덱스
+
+    Returns:
+        (표 구조 dict, 다음 처리할 인덱스) 또는 (None, start_idx) 파싱 실패시
+    """
+    if start_idx >= len(lines):
+        return None, start_idx
+
+    first_line = lines[start_idx].strip()
+
+    # 첫 번째 줄이 표 행인지 확인 (| 로 시작)
+    if not first_line.startswith('|'):
+        return None, start_idx
+
+    # 최소 2줄 필요 (헤더 + 구분선)
+    if start_idx + 1 >= len(lines):
+        return None, start_idx
+
+    second_line = lines[start_idx + 1].strip()
+    if not _is_table_separator(second_line):
+        return None, start_idx
+
+    # 헤더 행 파싱
+    headers = _parse_table_row(first_line)
+    if not headers:
+        return None, start_idx
+
+    # 데이터 행 파싱
+    rows = []
+    current_idx = start_idx + 2  # 구분선 다음부터
+
+    while current_idx < len(lines):
+        line = lines[current_idx].strip()
+        # 빈 줄이거나 표 행이 아니면 종료
+        if not line or not line.startswith('|'):
+            break
+        # 구분선은 무시 (다중 구분선 허용)
+        if _is_table_separator(line):
+            current_idx += 1
+            continue
+        row_cells = _parse_table_row(line)
+        # 열 개수 맞추기
+        while len(row_cells) < len(headers):
+            row_cells.append('')
+        rows.append(row_cells[:len(headers)])
+        current_idx += 1
+
+    return {
+        "type": "table",
+        "headers": headers,
+        "rows": rows
+    }, current_idx
+
+
+# =============================================================================
 # 콘텐츠 파싱 및 구조화
 # =============================================================================
 def _parse_content_structure(text: str) -> list[dict]:
     """
     텍스트를 파싱하여 구조화된 콘텐츠로 변환합니다.
+    마크다운 표, 리스트, 일반 문단을 인식합니다.
 
     Args:
         text: 원본 텍스트
@@ -452,9 +681,29 @@ def _parse_content_structure(text: str) -> list[dict]:
     result = []
     current_list = []
     current_list_type = None
+    i = 0
 
-    for line in lines:
+    while i < len(lines):
+        line = lines[i]
         stripped = line.strip()
+
+        # 마크다운 표 감지
+        if stripped.startswith('|'):
+            # 현재 리스트 종료
+            if current_list:
+                result.append({
+                    "type": current_list_type + "_list",
+                    "items": current_list
+                })
+                current_list = []
+                current_list_type = None
+
+            table_data, next_idx = _parse_markdown_table(lines, i)
+            if table_data:
+                result.append(table_data)
+                i = next_idx
+                continue
+            # 표 파싱 실패시 일반 문단으로 처리
 
         # Bullet 리스트
         if stripped.startswith('- ') or stripped.startswith('* '):
@@ -467,6 +716,7 @@ def _parse_content_structure(text: str) -> list[dict]:
                 current_list = []
                 current_list_type = 'bullet'
             current_list.append(stripped[2:])
+            i += 1
             continue
 
         # Numbered 리스트
@@ -480,6 +730,7 @@ def _parse_content_structure(text: str) -> list[dict]:
                 current_list = []
                 current_list_type = 'numbered'
             current_list.append(stripped[2:].strip())
+            i += 1
             continue
 
         # 리스트 종료
@@ -492,9 +743,11 @@ def _parse_content_structure(text: str) -> list[dict]:
             current_list_type = None
 
         if not stripped:
+            i += 1
             continue
 
         result.append({"type": "paragraph", "content": stripped})
+        i += 1
 
     if current_list:
         result.append({
@@ -508,6 +761,7 @@ def _parse_content_structure(text: str) -> list[dict]:
 def _add_structured_content(doc: Document, text: str) -> None:
     """
     구조화된 콘텐츠를 문서에 추가합니다.
+    마크다운 표, 리스트, 일반 문단을 렌더링합니다.
 
     Args:
         doc: python-docx Document 객체
@@ -527,6 +781,11 @@ def _add_structured_content(doc: Document, text: str) -> None:
             _add_bullet_list(doc, item["items"])
         elif item["type"] == "numbered_list":
             _add_numbered_list(doc, item["items"])
+        elif item["type"] == "table":
+            # 마크다운 표 렌더링
+            _add_table_with_header(doc, item["headers"], item["rows"])
+            # 표 후 여백 추가
+            doc.add_paragraph()
 
 
 # =============================================================================
@@ -745,6 +1004,9 @@ def _add_review_section(
 def create_document(
     title: str | None = None,
     include_toc: bool = False,
+    logo_path: str | Path | None = None,
+    author: str | None = None,
+    date: str | None = None,
 ) -> Document:
     """
     새 Document 객체를 생성합니다.
@@ -752,6 +1014,9 @@ def create_document(
     Args:
         title: 문서 제목 (None이면 제목 없음)
         include_toc: 목차 포함 여부
+        logo_path: 로고 이미지 경로 (None이면 기본 로고 사용, False면 로고 없음)
+        author: 작성자 (None이면 플레이스홀더 표시)
+        date: 작성일 (None이면 플레이스홀더 표시)
 
     Returns:
         초기화된 Document 객체
@@ -765,7 +1030,7 @@ def create_document(
     style.font.color.rgb = COLOR_TEXT_GRAY
     style.paragraph_format.line_spacing = LINE_SPACING
 
-    # Heading 스타일에 브랜드 컬러 적용
+    # Heading 스타일에 브랜드 컬러 적용 및 기본 테두리 제거
     for level, config in HEADING_STYLES.items():
         heading_style_name = f'Heading {level}'
         if heading_style_name in doc.styles:
@@ -775,16 +1040,15 @@ def create_document(
             h_style.font.bold = config["bold"]
             h_style.font.color.rgb = config["color"]
 
-    if title:
-        heading = doc.add_heading(title, level=1)
-        style_config = HEADING_STYLES[1]
-        heading.paragraph_format.space_after = style_config["space_after"]
+            # 기본 템플릿의 왼쪽 테두리(세로선) 제거
+            pPr = h_style._element.get_or_add_pPr()
+            pBdr = pPr.find(qn('w:pBdr'))
+            if pBdr is not None:
+                pPr.remove(pBdr)
 
-        for run in heading.runs:
-            run.font.size = style_config["size"]
-            run.font.bold = style_config["bold"]
-            run.font.color.rgb = style_config["color"]
-            _set_korean_font(run)
+    # 공식 문서 헤더 추가 (로고, 제목, 메타데이터, 구분선)
+    if title:
+        add_document_header(doc, title, logo_path, author, date)
 
     if include_toc:
         toc_title = doc.add_paragraph("목차")
@@ -807,6 +1071,9 @@ def build_document(
     section_results: list[tuple[dict, Route, list[dict]]],
     title: str = "Grounded Report",
     output_path: str = "output.docx",
+    logo_path: str | Path | None = None,
+    author: str | None = None,
+    date: str | None = None,
 ) -> None:
     """
     섹션 계획과 결과를 받아 문서를 조립합니다.
@@ -816,9 +1083,18 @@ def build_document(
         section_results: 섹션별 결과
         title: 문서 제목
         output_path: 출력 파일 경로
+        logo_path: 로고 이미지 경로 (None이면 기본 로고 사용)
+        author: 작성자 (None이면 플레이스홀더 표시)
+        date: 작성일 (None이면 플레이스홀더 표시)
     """
     include_toc = len(sections) >= TOC_THRESHOLD
-    doc = create_document(title=title, include_toc=include_toc)
+    doc = create_document(
+        title=title,
+        include_toc=include_toc,
+        logo_path=logo_path,
+        author=author,
+        date=date,
+    )
 
     for section, (llm_result, decision, sources) in zip(sections, section_results):
         add_section(doc, section["title"], llm_result, decision, sources)
