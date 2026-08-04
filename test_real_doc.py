@@ -60,7 +60,7 @@ def run_real_pipeline(
         output_path = f"output/report_{timestamp}_{hash_suffix}.docx"
 
     # 파이프라인 컨텍스트 (JSON 스트리밍 끔 - 깔끔한 출력)
-    ctx = PipelineContext("real_pipeline_test", stream_to_console=False)
+    ctx = PipelineContext("real_pipeline_test", stream_to_console=verbose)
 
     # 각 단계를 데코레이터로 래핑
     _plan_sections = log_step(ctx, "1. 섹션 계획 생성 (LLM)")(plan_sections)

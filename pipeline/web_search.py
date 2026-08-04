@@ -37,6 +37,13 @@ from tavily import TavilyClient
 load_dotenv()
 
 # =============================================================================
+# LLM 설정 (쿼리 번역용)
+# =============================================================================
+
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+MODEL_NAME = os.getenv("MODEL_NAME", "qwen2.5:7b-instruct-q4_0")
+
+# =============================================================================
 # 필터링 설정
 # =============================================================================
 
@@ -84,6 +91,60 @@ def _is_mock_mode() -> bool:
     """USE_MOCK_SEARCH 환경변수 확인"""
     value = os.getenv("USE_MOCK_SEARCH", "false").strip().lower()
     return value in ("true", "1", "yes")
+
+
+# =============================================================================
+# 쿼리 번역 (한국어 → 영어)
+# =============================================================================
+
+
+def _translate_query_to_english(query: str) -> str:
+    """
+    한국어 검색 쿼리를 영어로 번역합니다.
+
+    Args:
+        query: 한국어 검색 쿼리
+
+    Returns:
+        영어로 번역된 검색 쿼리 (실패 시 원본 반환)
+    """
+    if _is_mock_mode():
+        # Mock 모드에서는 번역 없이 원본 반환
+        return query
+
+    try:
+        url = f"{OLLAMA_BASE_URL}/api/chat"
+        payload = {
+            "model": MODEL_NAME,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a translator. Translate the given Korean search query "
+                        "to English. Output ONLY the translated query, nothing else. "
+                        "Keep it concise and search-friendly. Do not add explanations."
+                    ),
+                },
+                {"role": "user", "content": query},
+            ],
+            "stream": False,
+        }
+
+        response = requests.post(url, json=payload, timeout=30)
+        response.raise_for_status()
+
+        result = response.json()
+        translated = result.get("message", {}).get("content", "").strip()
+
+        if translated:
+            print(f"[translate] '{query}' → '{translated}'")
+            return translated
+
+        return query
+
+    except Exception as e:
+        print(f"[translate] ERROR: {type(e).__name__}: {e}, 원본 쿼리 사용")
+        return query
 
 
 # =============================================================================
@@ -413,13 +474,14 @@ def search_web(
 
     Args:
         query: 검색 쿼리 (한국어, Naver 검색에 사용)
-        query_global: 영어 쿼리 (Tavily 검색에 사용, None이면 query 그대로 사용)
+        query_global: 영어 쿼리 (Tavily 검색에 사용, None이면 자동 번역)
         max_results: 반환할 최대 결과 수 (각 소스별 max_results/2 + 1)
 
     Returns:
         SearchResponse: {"results": [...]} - 통합된 검색 결과
 
     Note:
+        - query_global이 None이면 LLM을 통해 한국어 → 영어 자동 번역
         - Tavily 결과에는 [글로벌] 태그 추가
         - Naver 결과에는 [국내] 태그 추가
         - score 기준 내림차순 정렬
@@ -429,8 +491,8 @@ def search_web(
     # 각 소스별 결과 수 계산
     per_source = max(max_results // 2 + 1, 2)
 
-    # Tavily 검색 (해외)
-    tavily_query = query_global if query_global else query
+    # Tavily 검색 (해외) - 영어 쿼리 자동 번역
+    tavily_query = query_global if query_global else _translate_query_to_english(query)
     tavily_results = search_tavily(tavily_query, max_results=per_source)
 
     # Naver 검색 (국내)

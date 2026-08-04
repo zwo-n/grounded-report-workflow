@@ -55,11 +55,10 @@ def run_pipeline_in_background(
     try:
         logger.info(f"파이프라인 시작: '{user_request}' (user={user_id})")
 
-        # 파이프라인 실행 (verbose=False로 콘솔 출력 최소화)
         output_path = run_real_pipeline(
             user_request=user_request,
             author=f"Slack User <@{user_id}>",
-            verbose=False,
+            verbose=True,
         )
 
         # 파일 존재 확인
