@@ -39,20 +39,27 @@ def process_section(
     section: dict,
     llm_client: Callable[[list[dict]], str] | None = None,
     classifier_client: Callable[[list[dict]], str] | None = None,
+    document_title: str | None = None,
 ) -> tuple[dict, Route, list[dict], str]:
     """
     단일 섹션을 처리합니다.
 
     Args:
         section: 섹션 정보 (title, query)
-        llm_client: LLM 클라이언트 (None이면 실제 Ollama API 호출)
-        classifier_client: 분류용 LLM 클라이언트 (None이면 실제 Ollama API 호출)
+        llm_client: LLM 클라이언트 (None이면 실제 Groq API 호출)
+        classifier_client: 분류용 LLM 클라이언트 (None이면 실제 Groq API 호출)
+        document_title: 문서 제목 (검색 쿼리에 topic 키워드 추가용)
 
     Returns:
         (llm_result, decision, sources, classified_type)
     """
     title = section["title"]
     query = section["query"]
+
+    # 검색 쿼리에 topic 키워드 포함 (검색 범위 확장 방지)
+    search_query = query
+    if document_title and document_title not in query:
+        search_query = f"{document_title} - {query}"
 
     # 1. classify_source_type으로 1차 분류
     classified_type = classify_source_type(
@@ -69,6 +76,7 @@ def process_section(
             sources=[],
             source_type="none",
             llm_client=llm_client,
+            topic=document_title,
         )
         decision = route(
             source_type=llm_result["source_type"],
@@ -79,14 +87,15 @@ def process_section(
         return llm_result, decision, [], classified_type
 
     elif classified_type == "web":
-        # 바로 웹 검색 수행
-        web_results = search_web(query)["results"]
+        # 바로 웹 검색 수행 (topic 포함 쿼리)
+        web_results = search_web(search_query, topic=document_title)["results"]
         sources = web_results
         llm_result = generate_section_draft(
             section_query=query,
             sources=sources,
             source_type="web",
             llm_client=llm_client,
+            topic=document_title,
         )
         decision = route(
             source_type=llm_result["source_type"],
@@ -98,19 +107,20 @@ def process_section(
 
     else:
         # classified_type == "internal"
-        # 내부 RAG 검색 수행
-        internal_results = search_internal_knowledge(query)["results"]
+        # 내부 RAG 검색 수행 (topic 포함 쿼리)
+        internal_results = search_internal_knowledge(search_query)["results"]
         sources = internal_results
         llm_result = generate_section_draft(
             section_query=query,
             sources=sources,
             source_type="internal",
             llm_client=llm_client,
+            topic=document_title,
         )
 
         # 결과가 없거나 source_relevance가 "low"면 웹 폴백
         if len(sources) == 0 or llm_result.get("source_relevance") == "low":
-            web_results = search_web(query)["results"]
+            web_results = search_web(search_query, topic=document_title)["results"]
             if web_results:
                 sources = web_results
                 llm_result = generate_section_draft(
@@ -118,6 +128,7 @@ def process_section(
                     sources=sources,
                     source_type="web",
                     llm_client=llm_client,
+                    topic=document_title,
                 )
 
         decision = route(
@@ -144,9 +155,9 @@ def run_pipeline(
         user_request: 사용자 요청 (예: "클라우드 비용 최적화 제안서 작성해줘")
         output_path: 출력 파일 경로
         template_hint: 문서 유형 힌트 (예: "제안서", "기술 보고서")
-        llm_client: LLM 클라이언트 (None이면 실제 Ollama API 호출)
-        classifier_client: 분류용 LLM 클라이언트 (None이면 실제 Ollama API 호출)
-        planner_client: 섹션 계획용 LLM 클라이언트 (None이면 실제 Ollama API 호출)
+        llm_client: LLM 클라이언트 (None이면 실제 Groq API 호출)
+        classifier_client: 분류용 LLM 클라이언트 (None이면 실제 Groq API 호출)
+        planner_client: 섹션 계획용 LLM 클라이언트 (None이면 실제 Groq API 호출)
     """
     print("=" * 60)
     print("Grounded Report Workflow 실행")
@@ -198,7 +209,7 @@ def run_pipeline(
         print(f"\n[처리 중] {title}...")
 
         llm_result, decision, sources, classified_type = process_section(
-            section, llm_client, classifier_client
+            section, llm_client, classifier_client, document_title
         )
 
         # 출처 수집 (참고 자료 섹션용)

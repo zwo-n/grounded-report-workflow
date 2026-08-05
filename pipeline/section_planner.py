@@ -13,8 +13,11 @@ section_planner.py - 섹션 구성 동적 생성 모듈
 """
 
 import json
-import requests
+import os
 from typing import Callable
+
+from dotenv import load_dotenv
+from groq import Groq
 
 from pipeline.templates import (
     get_template,
@@ -23,8 +26,18 @@ from pipeline.templates import (
     TEMPLATES,
 )
 
-OLLAMA_BASE_URL = "http://localhost:11434"
-MODEL_NAME = "qwen2.5:7b-instruct-q4_0"
+load_dotenv()
+
+MODEL_NAME = "openai/gpt-oss-20b"
+_groq_client: Groq | None = None
+
+
+def _get_groq_client() -> Groq:
+    """Groq 클라이언트 싱글톤"""
+    global _groq_client
+    if _groq_client is None:
+        _groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    return _groq_client
 
 # 사용 가능한 템플릿 목록 (동적으로 생성)
 AVAILABLE_TEMPLATES = list(TEMPLATES.keys())
@@ -107,9 +120,9 @@ PLANNER_SYSTEM_PROMPT_WITH_TEMPLATE = """당신은 보고서/제안서 구성 �
 }}"""
 
 
-def _call_ollama_for_planning(messages: list[dict]) -> str:
+def _call_groq_for_planning(messages: list[dict]) -> str:
     """
-    Ollama API를 호출하여 섹션 계획을 받습니다.
+    Groq API를 호출하여 섹션 계획을 받습니다.
 
     Args:
         messages: 대화 메시지 리스트
@@ -117,19 +130,15 @@ def _call_ollama_for_planning(messages: list[dict]) -> str:
     Returns:
         LLM 응답 텍스트
     """
-    url = f"{OLLAMA_BASE_URL}/api/chat"
-    payload = {
-        "model": MODEL_NAME,
-        "messages": messages,
-        "stream": False,
-        "format": "json",
-    }
-
-    response = requests.post(url, json=payload, timeout=120)
-    response.raise_for_status()
-
-    result = response.json()
-    return result.get("message", {}).get("content", "")
+    client = _get_groq_client()
+    response = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=messages,
+        temperature=0.3,
+        max_tokens=2048,
+        response_format={"type": "json_object"},
+    )
+    return response.choices[0].message.content or ""
 
 
 def _parse_plan_response(raw_output: str) -> tuple[list[dict], str | None, str | None]:
@@ -230,7 +239,7 @@ def plan_sections(
         user_request: 사용자 요청 (예: "클라우드 비용 최적화 제안서 작성해줘")
         template_hint: 문서 유형 힌트 (예: "제안서", "기술 보고서")
                        None이면 LLM이 자동 감지
-        llm_client: 테스트용 mock 함수 (None이면 실제 Ollama API 호출)
+        llm_client: 테스트용 mock 함수 (None이면 실제 Groq API 호출)
 
     Returns:
         (섹션 리스트, 문서 제목, 감지된 template_hint)
@@ -268,7 +277,7 @@ def plan_sections(
             {"role": "user", "content": user_message},
         ]
 
-        client = llm_client if llm_client is not None else _call_ollama_for_planning
+        client = llm_client if llm_client is not None else _call_groq_for_planning
         raw_output = client(messages)
 
         sections, document_title, _ = _parse_plan_response(raw_output)
@@ -289,7 +298,7 @@ def plan_sections(
         {"role": "user", "content": user_message},
     ]
 
-    client = llm_client if llm_client is not None else _call_ollama_for_planning
+    client = llm_client if llm_client is not None else _call_groq_for_planning
     raw_output = client(messages)
 
     sections, document_title, detected_hint = _parse_plan_response(raw_output)

@@ -11,13 +11,30 @@ LLM을 활용하여 섹션의 특성을 파악하고, 적절한 검색 전략을
 """
 
 import json
-import requests
+import os
 from typing import Callable, Literal
 
-OLLAMA_BASE_URL = "http://localhost:11434"
-MODEL_NAME = "qwen2.5:7b-instruct-q4_0"
+from dotenv import load_dotenv
+from groq import Groq
+
+load_dotenv()
+
+MODEL_NAME = "openai/gpt-oss-20b"
+_groq_client: Groq | None = None
+
+
+def _get_groq_client() -> Groq:
+    """Groq 클라이언트 싱글톤"""
+    global _groq_client
+    if _groq_client is None:
+        _groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    return _groq_client
 
 CLASSIFICATION_PROMPT = """당신은 보고서 섹션 분류 전문가입니다.
+
+## 절대 금지 사항
+- 도구(tool)를 호출하지 마세요. browser.open, search 등 어떤 도구도 사용하지 마세요.
+- 반드시 JSON 형식으로만 응답하세요.
 
 주어진 섹션 제목과 쿼리를 분석하여, 이 섹션을 작성하기 위해 어떤 종류의 정보가 필요한지 분류하세요.
 
@@ -38,9 +55,9 @@ CLASSIFICATION_PROMPT = """당신은 보고서 섹션 분류 전문가입니다.
 {"source_type": "none" 또는 "internal" 또는 "web"}"""
 
 
-def _call_ollama_for_classification(messages: list[dict]) -> str:
+def _call_groq_for_classification(messages: list[dict]) -> str:
     """
-    Ollama API를 호출하여 분류 결과를 받습니다.
+    Groq API를 호출하여 분류 결과를 받습니다.
 
     Args:
         messages: 대화 메시지 리스트
@@ -48,19 +65,15 @@ def _call_ollama_for_classification(messages: list[dict]) -> str:
     Returns:
         LLM 응답 텍스트
     """
-    url = f"{OLLAMA_BASE_URL}/api/chat"
-    payload = {
-        "model": MODEL_NAME,
-        "messages": messages,
-        "stream": False,
-        "format": "json",
-    }
-
-    response = requests.post(url, json=payload, timeout=60)
-    response.raise_for_status()
-
-    result = response.json()
-    return result.get("message", {}).get("content", "")
+    client = _get_groq_client()
+    response = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=messages,
+        temperature=0.3,
+        max_tokens=512,
+        response_format={"type": "json_object"},
+    )
+    return response.choices[0].message.content or ""
 
 
 def _parse_classification_response(
@@ -100,7 +113,7 @@ def classify_source_type(
     Args:
         section_title: 섹션 제목 (예: "회사 기술 역량")
         section_query: 섹션 쿼리 (예: "회사의 주요 기술 역량을 설명해주세요")
-        llm_client: 테스트용 mock 함수 (None이면 실제 Ollama API 호출)
+        llm_client: 테스트용 mock 함수 (None이면 실제 Groq API 호출)
 
     Returns:
         "none": 검색 불필요
@@ -118,7 +131,7 @@ def classify_source_type(
     ]
 
     # LLM 호출 (mock 또는 실제 API)
-    client = llm_client if llm_client is not None else _call_ollama_for_classification
+    client = llm_client if llm_client is not None else _call_groq_for_classification
     raw_output = client(messages)
 
     return _parse_classification_response(raw_output)

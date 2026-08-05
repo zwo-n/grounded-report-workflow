@@ -35,6 +35,60 @@ logger = logging.getLogger(__name__)
 app = App(token=os.environ.get("SLACK_BOT_TOKEN"))
 
 
+def format_summary_for_slack(summary: dict) -> str:
+    """
+    파이프라인 실행 요약을 Slack 메시지 형식으로 변환합니다.
+
+    Args:
+        summary: PipelineContext.get_summary() 결과
+
+    Returns:
+        Slack 메시지용 포맷된 문자열
+    """
+    total_ms = summary.get("total_duration_ms", 0)
+    total_sec = total_ms / 1000
+    total_steps = summary.get("total_steps", 0)
+    successful = summary.get("successful_steps", 0)
+    failed = summary.get("failed_steps", 0)
+
+    lines = [
+        f"*실행 요약*",
+        f"• 총 소요시간: `{total_sec:.1f}초`",
+        f"• 단계: {successful}/{total_steps} 성공" + (f" ({failed} 실패)" if failed > 0 else ""),
+        "",
+        "*단계별 소요시간*",
+    ]
+
+    # 주요 단계별 시간 (성공한 것만)
+    steps = summary.get("steps", [])
+    step_times = {}
+
+    for step in steps:
+        if step.get("status") == "success":
+            name = step.get("step_name", "")
+            duration = step.get("duration_ms", 0)
+
+            # 같은 이름의 단계는 합산 (예: 여러 섹션의 LLM 호출)
+            if name in step_times:
+                step_times[name]["count"] += 1
+                step_times[name]["total_ms"] += duration
+            else:
+                step_times[name] = {"count": 1, "total_ms": duration}
+
+    # 단계별 출력 (소요시간 내림차순)
+    sorted_steps = sorted(step_times.items(), key=lambda x: x[1]["total_ms"], reverse=True)
+
+    for name, data in sorted_steps[:6]:  # 상위 6개만
+        count = data["count"]
+        total = data["total_ms"] / 1000
+        if count > 1:
+            lines.append(f"• {name}: `{total:.1f}초` ({count}회)")
+        else:
+            lines.append(f"• {name}: `{total:.1f}초`")
+
+    return "\n".join(lines)
+
+
 def run_pipeline_in_background(
     user_request: str,
     channel_id: str,
@@ -55,10 +109,11 @@ def run_pipeline_in_background(
     try:
         logger.info(f"파이프라인 시작: '{user_request}' (user={user_id})")
 
-        output_path = run_real_pipeline(
+        output_path, summary = run_real_pipeline(
             user_request=user_request,
             author=f"Slack User <@{user_id}>",
             verbose=True,
+            return_summary=True,
         )
 
         # 파일 존재 확인
@@ -68,13 +123,20 @@ def run_pipeline_in_background(
         file_size = Path(output_path).stat().st_size
         logger.info(f"파이프라인 완료: {output_path} ({file_size:,} bytes)")
 
+        # 실행 요약 포맷
+        summary_text = format_summary_for_slack(summary)
+
         # Slack에 파일 업로드 (files_upload_v2 사용)
         result = client.files_upload_v2(
             channel=channel_id,
             file=output_path,
             filename=Path(output_path).name,
             title=f"문서: {user_request[:50]}{'...' if len(user_request) > 50 else ''}",
-            initial_comment=f"<@{user_id}> 요청하신 문서가 생성되었습니다.\n> {user_request}",
+            initial_comment=(
+                f"<@{user_id}> 요청하신 문서가 생성되었습니다.\n"
+                f"> {user_request}\n\n"
+                f"{summary_text}"
+            ),
         )
 
         logger.info(f"파일 업로드 완료: {result.get('file', {}).get('id', 'unknown')}")

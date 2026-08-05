@@ -37,11 +37,21 @@ from tavily import TavilyClient
 load_dotenv()
 
 # =============================================================================
-# LLM 설정 (쿼리 번역용)
+# LLM 설정 (쿼리 번역용 - Groq)
 # =============================================================================
 
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-MODEL_NAME = os.getenv("MODEL_NAME", "qwen2.5:7b-instruct-q4_0")
+from groq import Groq
+
+MODEL_NAME = "openai/gpt-oss-20b"
+_groq_client: Groq | None = None
+
+
+def _get_groq_client() -> Groq:
+    """Groq 클라이언트 싱글톤"""
+    global _groq_client
+    if _groq_client is None:
+        _groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    return _groq_client
 
 # =============================================================================
 # 필터링 설정
@@ -63,6 +73,13 @@ EXCLUDED_DOMAINS = [
     "reddit.com",
     "pinterest.com",
     "threads.net",
+]
+
+# topic 무관 콘텐츠 패턴 (인물 기사, 부고, 인터뷰 등)
+IRRELEVANT_PATTERNS = [
+    r"(인터뷰|대담|만나다|취임|사퇴|퇴임|부고|별세|타계|사망)",
+    r"(대표이사|CEO|회장|사장|이사).*?(취임|선임|연임)",
+    r"(수상|시상|공로상|대상|표창)",
 ]
 
 # Naver 검색 전용 제외 도메인 (품질 편차 큼)
@@ -113,10 +130,10 @@ def _translate_query_to_english(query: str) -> str:
         return query
 
     try:
-        url = f"{OLLAMA_BASE_URL}/api/chat"
-        payload = {
-            "model": MODEL_NAME,
-            "messages": [
+        client = _get_groq_client()
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
                 {
                     "role": "system",
                     "content": (
@@ -127,14 +144,11 @@ def _translate_query_to_english(query: str) -> str:
                 },
                 {"role": "user", "content": query},
             ],
-            "stream": False,
-        }
+            temperature=0.3,
+            max_tokens=256,
+        )
 
-        response = requests.post(url, json=payload, timeout=30)
-        response.raise_for_status()
-
-        result = response.json()
-        translated = result.get("message", {}).get("content", "").strip()
+        translated = response.choices[0].message.content.strip() if response.choices[0].message.content else ""
 
         if translated:
             print(f"[translate] '{query}' → '{translated}'")
@@ -171,6 +185,82 @@ def _is_excluded_domain(url: str, excluded_list: list[str]) -> bool:
         if domain == excluded or domain.endswith("." + excluded):
             return True
     return False
+
+
+def _is_irrelevant_content(title: str, content: str) -> bool:
+    """
+    topic과 무관한 콘텐츠(인물 기사 등)인지 확인합니다.
+
+    Args:
+        title: 기사 제목
+        content: 기사 내용
+
+    Returns:
+        True: 무관한 콘텐츠 (필터링 대상)
+        False: 관련 있는 콘텐츠
+    """
+    import re
+
+    text = f"{title} {content}"
+    for pattern in IRRELEVANT_PATTERNS:
+        if re.search(pattern, text):
+            return True
+    return False
+
+
+def _check_topic_relevance(
+    title: str, content: str, topic_keywords: list[str]
+) -> bool:
+    """
+    검색 결과가 topic과 관련 있는지 확인합니다.
+
+    매칭 전략: 키워드 중 1개 이상 포함되면 관련 있음으로 판단.
+    (무관 콘텐츠는 _is_irrelevant_content에서 별도 필터링)
+
+    Args:
+        title: 기사 제목
+        content: 기사 내용
+        topic_keywords: topic에서 추출한 키워드 리스트
+
+    Returns:
+        True: topic과 관련 있음
+        False: topic과 무관함
+    """
+    if not topic_keywords:
+        return True  # 키워드 없으면 모두 허용
+
+    text = f"{title} {content}".lower()
+
+    # 키워드 중 1개라도 포함되면 관련 있음
+    for keyword in topic_keywords:
+        if keyword.lower() in text:
+            return True
+    return False
+
+
+def _extract_topic_keywords(topic: str) -> list[str]:
+    """
+    topic에서 핵심 키워드를 추출합니다.
+
+    Args:
+        topic: 문서 주제 (예: "클라우드 비용 최적화 제안서")
+
+    Returns:
+        키워드 리스트 (예: ["클라우드", "비용", "최적화"])
+    """
+    import re
+
+    if not topic:
+        return []
+
+    # 불용어 제거
+    stopwords = {"제안서", "보고서", "분석", "관련", "대한", "위한", "통한"}
+
+    # 한글/영문 단어 추출 (2글자 이상)
+    words = re.findall(r"[가-힣a-zA-Z]{2,}", topic)
+    keywords = [w for w in words if w not in stopwords]
+
+    return keywords
 
 
 def _clean_html(text: str) -> str:
@@ -217,14 +307,17 @@ def _get_tavily_client() -> TavilyClient | None:
 
 def _filter_tavily_results(
     results: list[dict],
+    topic_keywords: list[str] | None = None,
 ) -> tuple[list[dict], dict[str, int]]:
     """Tavily 검색 결과를 필터링합니다."""
     filtered = []
-    stats = {"low_score": 0, "excluded_domain": 0}
+    stats = {"low_score": 0, "excluded_domain": 0, "irrelevant": 0, "off_topic": 0}
 
     for item in results:
         score = item.get("score", 0.0)
         url = item.get("source_url", "")
+        title = item.get("source_title", "")
+        content = item.get("content", "")
 
         if score < MIN_SCORE_THRESHOLD:
             stats["low_score"] += 1
@@ -232,6 +325,14 @@ def _filter_tavily_results(
 
         if _is_excluded_domain(url, EXCLUDED_DOMAINS):
             stats["excluded_domain"] += 1
+            continue
+
+        if _is_irrelevant_content(title, content):
+            stats["irrelevant"] += 1
+            continue
+
+        if topic_keywords and not _check_topic_relevance(title, content, topic_keywords):
+            stats["off_topic"] += 1
             continue
 
         filtered.append(item)
@@ -265,13 +366,18 @@ def _get_tavily_mock_results(max_results: int) -> list[SearchResult]:
     return mock_data[:max_results]
 
 
-def search_tavily(query: str, max_results: int = 5) -> SearchResponse:
+def search_tavily(
+    query: str,
+    max_results: int = 5,
+    topic_keywords: list[str] | None = None,
+) -> SearchResponse:
     """
     Tavily API로 해외/글로벌 웹 검색을 수행합니다.
 
     Args:
         query: 검색 쿼리 (영어 권장)
         max_results: 반환할 최대 결과 수
+        topic_keywords: topic 관련성 필터용 키워드 리스트
 
     Returns:
         SearchResponse: {"results": [...]}
@@ -309,15 +415,19 @@ def search_tavily(query: str, max_results: int = 5) -> SearchResponse:
                 "score": item.get("score", 0.0),
             })
 
-        filtered_results, stats = _filter_tavily_results(raw_results)
+        filtered_results, stats = _filter_tavily_results(raw_results, topic_keywords)
 
-        total_filtered = stats["low_score"] + stats["excluded_domain"]
+        total_filtered = sum(stats.values())
         if total_filtered > 0:
             reasons = []
             if stats["low_score"] > 0:
                 reasons.append(f"score<{MIN_SCORE_THRESHOLD}: {stats['low_score']}건")
             if stats["excluded_domain"] > 0:
                 reasons.append(f"제외도메인: {stats['excluded_domain']}건")
+            if stats["irrelevant"] > 0:
+                reasons.append(f"무관콘텐츠: {stats['irrelevant']}건")
+            if stats["off_topic"] > 0:
+                reasons.append(f"topic무관: {stats['off_topic']}건")
             print(f"[tavily] {total_filtered}건 필터링됨 ({', '.join(reasons)})")
 
         final_results = filtered_results[:max_results]
@@ -375,13 +485,18 @@ def _get_naver_mock_results(max_results: int) -> list[SearchResult]:
     return mock_data[:max_results]
 
 
-def search_naver(query: str, max_results: int = 5) -> SearchResponse:
+def search_naver(
+    query: str,
+    max_results: int = 5,
+    topic_keywords: list[str] | None = None,
+) -> SearchResponse:
     """
     NCP API Hub로 네이버 뉴스 검색을 수행합니다.
 
     Args:
         query: 검색 쿼리 (한국어)
         max_results: 반환할 최대 결과 수
+        topic_keywords: topic 관련성 필터용 키워드 리스트
 
     Returns:
         SearchResponse: {"results": [...]}
@@ -428,24 +543,42 @@ def search_naver(query: str, max_results: int = 5) -> SearchResponse:
 
         items = data.get("items", [])
         raw_results: list[SearchResult] = []
-        excluded_count = 0
+        stats = {"excluded_domain": 0, "irrelevant": 0, "off_topic": 0}
 
         for rank, item in enumerate(items, 1):
             url = item.get("link", "")
+            title = _clean_html(item.get("title", ""))
+            content = _clean_html(item.get("description", ""))
 
             if _is_excluded_domain(url, NAVER_EXCLUDED_DOMAINS):
-                excluded_count += 1
+                stats["excluded_domain"] += 1
+                continue
+
+            if _is_irrelevant_content(title, content):
+                stats["irrelevant"] += 1
+                continue
+
+            if topic_keywords and not _check_topic_relevance(title, content, topic_keywords):
+                stats["off_topic"] += 1
                 continue
 
             raw_results.append({
-                "content": _clean_html(item.get("description", "")),
-                "source_title": _clean_html(item.get("title", "")),
+                "content": content,
+                "source_title": title,
                 "source_url": url,
                 "score": _calculate_naver_score(rank, len(items)),
             })
 
-        if excluded_count > 0:
-            print(f"[naver] {excluded_count}건 필터링됨 (제외도메인)")
+        total_filtered = sum(stats.values())
+        if total_filtered > 0:
+            reasons = []
+            if stats["excluded_domain"] > 0:
+                reasons.append(f"제외도메인: {stats['excluded_domain']}건")
+            if stats["irrelevant"] > 0:
+                reasons.append(f"무관콘텐츠: {stats['irrelevant']}건")
+            if stats["off_topic"] > 0:
+                reasons.append(f"topic무관: {stats['off_topic']}건")
+            print(f"[naver] {total_filtered}건 필터링됨 ({', '.join(reasons)})")
 
         final_results = raw_results[:max_results]
         print(f"[naver] 결과 {len(final_results)}건 반환")
@@ -468,6 +601,7 @@ def search_web(
     query: str,
     query_global: str | None = None,
     max_results: int = 5,
+    topic: str | None = None,
 ) -> SearchResponse:
     """
     Tavily (해외)와 Naver (국내) 검색 결과를 통합합니다.
@@ -476,6 +610,7 @@ def search_web(
         query: 검색 쿼리 (한국어, Naver 검색에 사용)
         query_global: 영어 쿼리 (Tavily 검색에 사용, None이면 자동 번역)
         max_results: 반환할 최대 결과 수 (각 소스별 max_results/2 + 1)
+        topic: 문서 주제 (관련성 필터링에 사용)
 
     Returns:
         SearchResponse: {"results": [...]} - 통합된 검색 결과
@@ -484,19 +619,25 @@ def search_web(
         - query_global이 None이면 LLM을 통해 한국어 → 영어 자동 번역
         - Tavily 결과에는 [글로벌] 태그 추가
         - Naver 결과에는 [국내] 태그 추가
+        - topic과 무관한 결과(인물 기사 등)는 필터링됨
         - score 기준 내림차순 정렬
     """
     print(f"[search_web] 통합 검색 시작: {query[:50]}...")
+
+    # topic에서 키워드 추출
+    topic_keywords = _extract_topic_keywords(topic) if topic else None
+    if topic_keywords:
+        print(f"[search_web] topic 키워드: {topic_keywords}")
 
     # 각 소스별 결과 수 계산
     per_source = max(max_results // 2 + 1, 2)
 
     # Tavily 검색 (해외) - 영어 쿼리 자동 번역
     tavily_query = query_global if query_global else _translate_query_to_english(query)
-    tavily_results = search_tavily(tavily_query, max_results=per_source)
+    tavily_results = search_tavily(tavily_query, max_results=per_source, topic_keywords=topic_keywords)
 
     # Naver 검색 (국내)
-    naver_results = search_naver(query, max_results=per_source)
+    naver_results = search_naver(query, max_results=per_source, topic_keywords=topic_keywords)
 
     # 결과 통합
     combined: list[SearchResult] = []

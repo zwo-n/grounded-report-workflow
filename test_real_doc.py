@@ -37,7 +37,8 @@ def run_real_pipeline(
     output_path: str | None = None,
     author: str = "Grounded Report",
     verbose: bool = True,
-) -> str:
+    return_summary: bool = False,
+) -> str | tuple[str, dict]:
     """
     실제 API를 호출하는 전체 파이프라인 실행
 
@@ -46,9 +47,11 @@ def run_real_pipeline(
         output_path: 출력 파일 경로 (None이면 자동 생성)
         author: 문서 작성자
         verbose: 콘솔 출력 여부
+        return_summary: True면 (output_path, summary_dict) 반환
 
     Returns:
-        생성된 문서 파일 경로
+        str: 생성된 문서 파일 경로 (return_summary=False)
+        tuple[str, dict]: (파일 경로, 실행 요약) (return_summary=True)
     """
     import hashlib
     import time
@@ -112,6 +115,7 @@ def run_real_pipeline(
 
         # 3. 각 섹션 처리 (출처 수집)
         all_sources = []
+        section_summaries = []  # 결론 작성용 앞 섹션 요약
 
         for i, section in enumerate(sections):
             title = section["title"]
@@ -119,23 +123,37 @@ def run_real_pipeline(
             if verbose:
                 print(f"\n[처리 중] 섹션 {i+1}/{len(sections)}: {title}")
 
-            # 소스 유형 분류
-            source_type = _classify(
-                section_title=title,
-                section_query=query,
-            )
-            if verbose:
-                print(f"  → 소스 유형: {source_type}")
+            # 마지막 섹션만 결론으로 처리 (source_type="none", 앞 섹션 요약 주입)
+            # 중간 섹션은 키워드와 관계없이 classifier 결과를 따름
+            is_last_section = (i == len(sections) - 1)
+
+            if is_last_section:
+                source_type = "none"
+                if verbose:
+                    print(f"  → 소스 유형: none (마지막 섹션 = 결론)")
+            else:
+                source_type = _classify(
+                    section_title=title,
+                    section_query=query,
+                )
+                if verbose:
+                    print(f"  → 소스 유형: {source_type}")
 
             # 분류 결과에 따라 검색
+            # 쿼리에 topic 키워드가 없으면 추가 (검색 범위 확장 방지)
+            search_query = query
+            if document_title and document_title not in query:
+                # topic에서 핵심 키워드 추출하여 쿼리 앞에 추가
+                search_query = f"{document_title} - {query}"
+
             sources = []
             if source_type == "internal":
-                result = _search_internal(query)
+                result = _search_internal(search_query)
                 sources = result.get("results", [])
                 if verbose:
                     print(f"  → 내부 검색 결과: {len(sources)}건")
             elif source_type == "web":
-                result = _search_web(query)
+                result = _search_web(search_query, topic=document_title)
                 sources = result.get("results", [])
                 if verbose:
                     print(f"  → 웹 검색 결과: {len(sources)}건")
@@ -147,14 +165,25 @@ def run_real_pipeline(
             if sources:
                 all_sources.append(sources)
 
-            # LLM 초안 생성
+            # LLM 초안 생성 (마지막 섹션이면 앞 섹션 요약 전달)
+            prev_summary = "\n\n".join(section_summaries) if is_last_section else None
+
             llm_result = _generate_draft(
                 section_query=query,
                 sources=sources,
                 source_type=source_type,
+                topic=document_title,
+                previous_sections_summary=prev_summary,
             )
             if verbose:
                 print(f"  → LLM 생성 완료 (답변 길이: {len(llm_result.get('answer', ''))}자)")
+
+            # 앞 섹션 본문 수집 (결론 제외) - 각 섹션 앞 300자
+            if not is_last_section and llm_result.get("answer"):
+                answer = llm_result["answer"]
+                # 앞 2~3문장 (약 300자) 추출
+                excerpt = answer[:300].rsplit(".", 1)[0] + "." if len(answer) > 300 else answer
+                section_summaries.append(f"[{title}]\n{excerpt}")
 
             # 라우팅 결정
             decision = _route(
@@ -192,6 +221,11 @@ def run_real_pipeline(
     # 타임라인 요약 출력
     if verbose:
         print_summary(ctx, detailed=False)
+
+    # 요약 반환 옵션
+    if return_summary:
+        ctx.finish()
+        return output_path, ctx.get_summary()
 
     return output_path
 
