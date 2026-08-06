@@ -102,6 +102,19 @@ nohup python slack_app.py >> slack_app.log 2>&1 &
 
 ### 4.2 Slack 명령어
 
+#### 일반 모드 (웹 검색 기반)
+```
+/report [요청 내용]
+```
+
+**사용 예시:**
+```
+/report AWS 클라우드 비용 최적화 방안에 대한 기술 보고서를 작성해줘
+```
+- 웹 검색(Tavily, Naver)을 통해 정보를 수집하여 보고서 자동 생성
+- CSV 파일 불필요
+
+#### 템플릿 모드 (CSV 데이터 기반)
 ```
 /report [보고서 제목] --template [템플릿명]
 ```
@@ -113,6 +126,9 @@ nohup python slack_app.py >> slack_app.log 2>&1 &
    /report 7월 활동 보고서 --template gambarlabs_report
    ```
 3. 봇이 Word 문서 생성 후 채널에 업로드
+
+- 내부 정의된 템플릿에 CSV 데이터를 기반으로 내용 채워넣기
+- 제공된 데이터 외 내용은 생성하지 않음 (근거 기반)
 
 ### 4.3 지원 템플릿
 
