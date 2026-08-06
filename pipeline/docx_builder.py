@@ -1689,6 +1689,141 @@ def save_document(doc: Document, filepath: str) -> None:
 
 
 # =============================================================================
+# 템플릿 기반 문서 생성 (provided_data 모드용)
+# =============================================================================
+def _replace_placeholder_in_cell(cell, placeholder: str, content: str) -> bool:
+    """
+    표 셀 내 플레이스홀더를 콘텐츠로 치환합니다.
+
+    Args:
+        cell: python-docx TableCell 객체
+        placeholder: 플레이스홀더 문자열 (예: "{{TITLE}}")
+        content: 치환할 내용
+
+    Returns:
+        치환 성공 여부
+    """
+    replaced = False
+    for paragraph in cell.paragraphs:
+        if placeholder in paragraph.text:
+            # 기존 텍스트에서 플레이스홀더 치환
+            paragraph.text = paragraph.text.replace(placeholder, content)
+            # 폰트 스타일 적용
+            for run in paragraph.runs:
+                _set_korean_font(run)
+                run.font.size = DEFAULT_FONT_SIZE
+                run.font.color.rgb = COLOR_TEXT_GRAY
+            replaced = True
+    return replaced
+
+
+def _replace_placeholder_in_document(doc: Document, placeholder: str, content: str) -> int:
+    """
+    문서 전체에서 플레이스홀더를 치환합니다 (표 + 문단).
+
+    Args:
+        doc: python-docx Document 객체
+        placeholder: 플레이스홀더 문자열
+        content: 치환할 내용
+
+    Returns:
+        치환된 횟수
+    """
+    count = 0
+
+    # 표 내 치환
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                if _replace_placeholder_in_cell(cell, placeholder, content):
+                    count += 1
+
+    # 문단 내 치환 (표지 등)
+    for paragraph in doc.paragraphs:
+        if placeholder in paragraph.text:
+            paragraph.text = paragraph.text.replace(placeholder, content)
+            for run in paragraph.runs:
+                _set_korean_font(run)
+            count += 1
+
+    return count
+
+
+def build_from_template(
+    template_path: str | Path,
+    placeholders: dict[str, str],
+) -> Document:
+    """
+    템플릿 파일을 열어 플레이스홀더를 치환한 Document를 반환합니다.
+
+    gambarlabs_report 템플릿 플레이스홀더:
+    - {{TITLE}}: 문서 제목
+    - {{PERIOD}}: 보고 기간
+    - {{PROJECT}}: 프로젝트명
+    - {{OVERVIEW}}: 개요 섹션 내용
+    - {{MAIN_CONTENT}}: 주요내용 섹션 내용
+    - {{CONCLUSION}}: 결론및제언 섹션 내용
+    - {{REFERENCES}}: 참고 자료 목록
+    - {{REVIEWER}}: 검토자
+    - {{REVIEW_DATE}}: 검토일
+
+    Args:
+        template_path: 템플릿 파일 경로
+        placeholders: 플레이스홀더 치환 딕셔너리
+
+    Returns:
+        치환된 Document 객체
+
+    Raises:
+        FileNotFoundError: 템플릿 파일이 없는 경우
+    """
+    template_path = Path(template_path)
+    if not template_path.exists():
+        raise FileNotFoundError(f"템플릿 파일을 찾을 수 없습니다: {template_path}")
+
+    doc = Document(str(template_path))
+
+    # 플레이스홀더 치환
+    for placeholder, content in placeholders.items():
+        # {{}} 형식 보장
+        if not placeholder.startswith("{{"):
+            placeholder = f"{{{{{placeholder}}}}}"
+        _replace_placeholder_in_document(doc, placeholder, content)
+
+    return doc
+
+
+def get_template_path(template_hint: str) -> Path | None:
+    """
+    템플릿 힌트에 해당하는 docx 템플릿 파일 경로를 반환합니다.
+
+    Args:
+        template_hint: 템플릿 힌트 (예: "gambarlabs_report")
+
+    Returns:
+        템플릿 파일 경로 또는 None
+    """
+    from pipeline.templates import TEMPLATES
+
+    template = TEMPLATES.get(template_hint)
+    if template is None:
+        return None
+
+    docx_path = template.get("docx_template_path")
+    if docx_path is None:
+        return None
+
+    # 상대 경로를 절대 경로로 변환
+    base_dir = Path(__file__).parent.parent
+    full_path = base_dir / docx_path
+
+    if full_path.exists():
+        return full_path
+
+    return None
+
+
+# =============================================================================
 # 유틸리티 함수
 # =============================================================================
 def add_table(

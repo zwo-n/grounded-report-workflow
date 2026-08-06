@@ -24,6 +24,8 @@ from pipeline.templates import (
     format_template_as_example,
     format_templates_for_detection,
     TEMPLATES,
+    is_fixed_template,
+    get_fixed_sections,
 )
 
 load_dotenv()
@@ -223,10 +225,49 @@ def _parse_plan_response(raw_output: str) -> tuple[list[dict], str | None, str |
         return default_sections, None, None
 
 
+def _extract_title_from_request(user_request: str) -> str:
+    """
+    사용자 요청에서 문서 제목을 추출합니다.
+    고정 템플릿 모드에서 LLM 호출 없이 사용.
+
+    Args:
+        user_request: 사용자 요청
+
+    Returns:
+        추출된 문서 제목
+    """
+    title = user_request
+
+    # 명령어 어미 제거
+    suffixes = [
+        "를 작성해줘",
+        "을 작성해줘",
+        "를 작성해주세요",
+        "을 작성해주세요",
+        "작성해줘",
+        "작성해주세요",
+        "해줘",
+        "해주세요",
+        "부탁해",
+        "부탁해요",
+    ]
+    for suffix in suffixes:
+        if title.endswith(suffix):
+            title = title[: -len(suffix)].strip()
+            break
+
+    # 너무 길면 자르기
+    if len(title) > 50:
+        title = title[:50] + "..."
+
+    return title if title else "활동 보고서"
+
+
 def plan_sections(
     user_request: str,
     template_hint: str | None = None,
     llm_client: Callable[[list[dict]], str] | None = None,
+    force_fixed: bool = False,
 ) -> tuple[list[dict], str | None, str | None]:
     """
     사용자 요청을 분석하여 섹션 구성을 생성합니다.
@@ -240,6 +281,8 @@ def plan_sections(
         template_hint: 문서 유형 힌트 (예: "제안서", "기술 보고서")
                        None이면 LLM이 자동 감지
         llm_client: 테스트용 mock 함수 (None이면 실제 Groq API 호출)
+        force_fixed: True면 고정 템플릿 섹션을 LLM 호출 없이 반환
+                     (provided_data 모드에서 사용)
 
     Returns:
         (섹션 리스트, 문서 제목, 감지된 template_hint)
@@ -247,6 +290,15 @@ def plan_sections(
         - 문서 제목: LLM이 생성한 공식 문서 제목 또는 None
         - template_hint: 명시적 제공 시 해당 값, 자동 감지 시 감지된 값 또는 None
     """
+    # Case 0: 고정 템플릿 분기 (LLM 호출 스킵)
+    if template_hint and (force_fixed or is_fixed_template(template_hint)):
+        fixed_sections = get_fixed_sections(template_hint)
+        if fixed_sections:
+            # 문서 제목은 사용자 요청에서 추출 (간단한 규칙)
+            document_title = _extract_title_from_request(user_request)
+            print(f"[section_planner] 고정 템플릿 사용: {template_hint}")
+            return fixed_sections, document_title, template_hint
+
     # Case 1: template_hint가 명시적으로 제공된 경우
     if template_hint is not None:
         template = get_template(template_hint)

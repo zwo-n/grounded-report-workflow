@@ -230,6 +230,45 @@ has_fabrication_risk는 구체적인 사실을 지어낸 경우에만 true입니
 일반적인 서술은 false로 설정하세요."""
 
 
+SYSTEM_PROMPT_PROVIDED_DATA = """당신은 보고서 작성을 돕는 AI 어시스턴트입니다.
+
+## 절대 금지 사항
+- 도구(tool)를 호출하지 마세요. browser.open, search 등 어떤 도구도 사용하지 마세요.
+- 반드시 JSON 형식으로만 응답하세요.
+
+## 언어 규칙 (절대 준수)
+- "answer" 필드는 반드시 한국어로만 작성하세요.
+- 중국어(中文), 일본어 등 다른 언어로 절대 전환하지 마세요. 문장 중간에도 예외 없습니다.
+- 영어 기술 용어(AWS, API, Bedrock, LangGraph 등)는 원문 그대로 사용 가능합니다.
+
+## 핵심 규칙
+이 섹션은 사용자가 직접 제공한 데이터(Excel/CSV 등)를 근거로 작성합니다.
+
+1. 반드시 제공된 데이터(source)만을 근거로 답변하세요.
+2. 제공된 데이터에 없는 내용은 절대 지어내지 마세요.
+3. 데이터를 체계적으로 정리하고 요약하세요.
+4. 날짜, 담당자, 구분 등 메타데이터가 있으면 활용하세요.
+5. 답변 본문에 "출처 1", "출처 2" 같은 번호 인용을 넣지 마세요.
+
+응답 형식:
+반드시 아래 JSON 형식으로만 응답하세요.
+
+{
+    "answer": "제공된 데이터를 바탕으로 작성한 내용",
+    "source_type": "provided_data",
+    "source_count": 실제로 참조한 데이터 개수 (정수),
+    "source_relevance": "high/medium/low 중 하나",
+    "has_fabrication_risk": false
+}
+
+source_relevance 판단 기준:
+- high: 질문에 직접적으로 답할 수 있는 명확한 데이터가 있음
+- medium: 관련 정보는 있으나 직접적인 답변은 아님
+- low: 관련성이 낮거나 데이터가 불충분함
+
+has_fabrication_risk는 제공된 데이터에 없는 내용을 추가한 경우에만 true입니다."""
+
+
 def _call_groq(messages: list[dict]) -> str:
     """
     Groq API를 호출하여 응답을 받습니다.
@@ -457,6 +496,12 @@ def generate_section_draft(
             "has_fabrication_risk": False,
         }
 
+    # source_type별 시스템 프롬프트 선택
+    if source_type == "provided_data":
+        system_prompt = SYSTEM_PROMPT_PROVIDED_DATA
+    else:
+        system_prompt = SYSTEM_PROMPT
+
     # 메시지 구성
     formatted_sources = _format_sources(sources)
     user_message = f"""질문: {section_query}
@@ -469,7 +514,7 @@ def generate_section_draft(
 [중요] source_type 필드는 반드시 아래 값을 그대로 사용하세요 (모델이 임의로 바꾸지 말 것): {source_type}"""
 
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_message},
     ]
 

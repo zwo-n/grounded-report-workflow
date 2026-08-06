@@ -32,6 +32,31 @@ TEMPLATES: dict[str, dict] = {
             {"title": "결론", "query": "분석 결과를 요약하고 시사점을 제시해주세요", "order": 5},
         ],
     },
+    "gambarlabs_report": {
+        "description": "감바랩스 고정 형식 활동 보고서",
+        "docx_template_path": "assets/gambarlabs_report_template.docx",
+        "fixed": True,  # LLM 호출 없이 고정 섹션 사용
+        "sections": [
+            {
+                "title": "개요",
+                "query": "보고서 개요를 작성해주세요. 보고 기간, 목적, 주요 활동 요약을 포함합니다.",
+                "order": 1,
+                "match_keywords": ["개요", "목적", "요약", "기간"],
+            },
+            {
+                "title": "주요내용",
+                "query": "주요 활동 내용을 상세히 기술해주세요. 개발, 회의, 테스트 등 활동별로 정리합니다.",
+                "order": 2,
+                "match_keywords": ["개발", "회의", "테스트", "활동", "내용", "결과"],
+            },
+            {
+                "title": "결론및제언",
+                "query": "활동 결과를 요약하고 향후 계획 및 제언을 작성해주세요.",
+                "order": 3,
+                "match_keywords": ["결론", "제언", "향후", "계획", "개선", "이슈"],
+            },
+        ],
+    },
 }
 
 
@@ -80,3 +105,40 @@ def format_templates_for_detection() -> str:
         description = template.get("description", "")
         lines.append(f'- "{name}": {description}')
     return "\n".join(lines)
+
+
+def is_fixed_template(hint: str) -> bool:
+    """
+    템플릿이 고정 템플릿인지 확인합니다.
+
+    고정 템플릿은 LLM 호출 없이 미리 정의된 섹션을 그대로 사용합니다.
+    provided_data 모드에서 주로 사용됩니다.
+
+    Args:
+        hint: 템플릿 힌트
+
+    Returns:
+        True: 고정 템플릿 (LLM 호출 없이 섹션 사용)
+        False: 동적 템플릿 (LLM이 섹션 조정)
+    """
+    template = TEMPLATES.get(hint)
+    if template is None:
+        return False
+    return template.get("fixed", False)
+
+
+def get_fixed_sections(hint: str) -> list[dict] | None:
+    """
+    고정 템플릿의 섹션 리스트를 반환합니다.
+
+    Args:
+        hint: 템플릿 힌트
+
+    Returns:
+        섹션 리스트 또는 None (고정 템플릿이 아닌 경우)
+    """
+    template = TEMPLATES.get(hint)
+    if template is None or not template.get("fixed", False):
+        return None
+
+    return template.get("sections", [])

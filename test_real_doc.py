@@ -147,11 +147,25 @@ def run_real_pipeline(
                 search_query = f"{document_title} - {query}"
 
             sources = []
+            final_source_type = source_type  # 최종 소스 타입 (폴백 시 변경됨)
+
             if source_type == "internal":
                 result = _search_internal(search_query)
                 sources = result.get("results", [])
                 if verbose:
                     print(f"  → 내부 검색 결과: {len(sources)}건")
+
+                # 내부 검색 결과가 없으면 웹 폴백
+                if len(sources) == 0:
+                    if verbose:
+                        print(f"  → 웹 폴백 시도...")
+                    result = _search_web(search_query, topic=document_title)
+                    sources = result.get("results", [])
+                    if sources:
+                        final_source_type = "web"
+                        if verbose:
+                            print(f"  → 웹 폴백 결과: {len(sources)}건")
+
             elif source_type == "web":
                 result = _search_web(search_query, topic=document_title)
                 sources = result.get("results", [])
@@ -171,7 +185,7 @@ def run_real_pipeline(
             llm_result = _generate_draft(
                 section_query=query,
                 sources=sources,
-                source_type=source_type,
+                source_type=final_source_type,
                 topic=document_title,
                 previous_sections_summary=prev_summary,
             )

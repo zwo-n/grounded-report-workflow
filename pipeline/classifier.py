@@ -8,6 +8,8 @@ LLM을 활용하여 섹션의 특성을 파악하고, 적절한 검색 전략을
 - "none": 서론/결론처럼 검색 없이 일반적으로 작성 가능한 섹션
 - "internal": 회사 내부 정보(기술 역량, 프로젝트 경험 등)가 필요한 섹션
 - "web": 외부 시장 동향, 경쟁사 정보 등 외부 정보가 필요한 섹션
+- "provided_data": 사용자가 직접 제공한 데이터(Excel/CSV 등)를 사용하는 섹션
+  (이 타입은 LLM 분류가 아닌, provided_chunks 존재 여부로 결정됨)
 """
 
 import json
@@ -20,6 +22,9 @@ from groq import Groq
 load_dotenv()
 
 MODEL_NAME = "openai/gpt-oss-20b"
+
+# source_type 타입 별칭
+SourceType = Literal["none", "internal", "web", "provided_data"]
 _groq_client: Groq | None = None
 
 
@@ -78,7 +83,7 @@ def _call_groq_for_classification(messages: list[dict]) -> str:
 
 def _parse_classification_response(
     raw_output: str,
-) -> Literal["none", "internal", "web"]:
+) -> SourceType:
     """
     LLM 응답을 파싱하여 source_type을 추출합니다.
 
@@ -86,15 +91,15 @@ def _parse_classification_response(
         raw_output: LLM의 원시 응답
 
     Returns:
-        source_type ("none", "internal", "web")
+        source_type ("none", "internal", "web", "provided_data")
         파싱 실패 시 기본값 "internal" 반환 (안전한 폴백)
     """
     try:
         result = json.loads(raw_output)
         source_type = result.get("source_type", "internal")
 
-        # 유효한 값인지 검증
-        if source_type in ("none", "internal", "web"):
+        # 유효한 값인지 검증 (provided_data 포함)
+        if source_type in ("none", "internal", "web", "provided_data"):
             return source_type
         return "internal"  # 유효하지 않은 값이면 internal로 폴백
 
@@ -106,7 +111,7 @@ def classify_source_type(
     section_title: str,
     section_query: str,
     llm_client: Callable[[list[dict]], str] | None = None,
-) -> Literal["none", "internal", "web"]:
+) -> SourceType:
     """
     섹션의 source_type을 분류합니다.
 
@@ -135,3 +140,5 @@ def classify_source_type(
     raw_output = client(messages)
 
     return _parse_classification_response(raw_output)
+
+

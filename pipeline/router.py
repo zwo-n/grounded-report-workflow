@@ -5,10 +5,11 @@ LLM이 생성한 메타데이터를 기반으로 최종 승인 상태를 결정�
 순수 함수로 구현되며, LLM 관여 없이 규칙 기반으로 동작합니다.
 
 입력: LLM이 판단한 결과
-- source_type: 출처 유형 (아래 3가지 값만 허용)
+- source_type: 출처 유형 (아래 4가지 값 허용)
   - "internal": 사내 RAG 검색 결과를 근거로 사용
   - "web": 웹 검색 결과를 근거로 사용 (내부 근거 부족 시 폴백)
   - "none": 근거가 필요 없는 서술형 섹션
+  - "provided_data": 사용자가 직접 제공한 데이터(Excel/CSV 등) 사용
 - source_count: 참조한 출처 개수
 - source_relevance: 출처의 관련성 점수
 - has_fabrication_risk: 허위 생성 위험 여부
@@ -61,7 +62,7 @@ def route(
     LLM 메타데이터를 기반으로 승인 라우팅을 결정합니다.
 
     Args:
-        source_type: 출처 유형 ("internal", "web", "none")
+        source_type: 출처 유형 ("internal", "web", "none", "provided_data")
         source_count: 참조한 출처 개수
         source_relevance: 출처 관련성 ("high", "medium", "low")
         has_fabrication_risk: 허위 생성 위험 여부
@@ -76,7 +77,17 @@ def route(
     if source_type == "none":
         return Route.AUTO_APPROVE
 
-    # 2. 내부 RAG 검색 결과 기반 + 높은 관련성 + 허위 생성 위험 없음
+    # 2. 사용자 제공 데이터 기반 + 중간 이상 관련성 + 허위 생성 위험 없음
+    # 사용자가 직접 제공한 데이터이므로 신뢰도가 높음 (internal보다 높음)
+    # medium 관련성까지 자동 승인 (데이터 매칭이 완벽하지 않을 수 있음)
+    if (
+        source_type == "provided_data"
+        and source_relevance in ("high", "medium")
+        and not has_fabrication_risk
+    ):
+        return Route.AUTO_APPROVE
+
+    # 3. 내부 RAG 검색 결과 기반 + 높은 관련성 + 허위 생성 위험 없음
     # 사내 문서는 신뢰도가 가장 높으므로 high 관련성만 자동 승인
     # medium/low는 근거가 불충분할 수 있어 검토 필요
     if (
@@ -86,7 +97,7 @@ def route(
     ):
         return Route.AUTO_APPROVE
 
-    # 3. 웹 검색 폴백 결과 + 중간 이상 관련성 + 허위 생성 위험 없음
+    # 4. 웹 검색 폴백 결과 + 중간 이상 관련성 + 허위 생성 위험 없음
     # 내부 RAG에서 근거를 찾지 못해 웹으로 폴백한 경우
     # 웹 검색은 내부 문서보다 신뢰도가 낮으므로 medium까지 허용
     # (내부 근거 부족 시 웹이라도 있으면 활용하는 전략)
@@ -97,7 +108,7 @@ def route(
     ):
         return Route.AUTO_APPROVE
 
-    # 4. 그 외 모든 경우 → NEEDS_REVIEW
+    # 5. 그 외 모든 경우 → NEEDS_REVIEW
     # - source_relevance가 "low"인 경우 (근거 불충분)
     # - has_fabrication_risk가 True인 경우 (허위 생성 위험)
     # - 알 수 없는 source_type인 경우 (방어적 처리)
