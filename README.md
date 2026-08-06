@@ -1,100 +1,291 @@
-# grounded-report-workflow
+# Grounded Report Workflow
 
-계획서/보고서 작성을 위한 LLM 활용 워크플로우.
-근거 문서(사내 RAG, 웹 검색)를 tool로 호출하여 섹션별 초안을 생성하고, 근거 신뢰도에 따라 자동 승인/검토 필요를 라우팅한다.
+> LLM 기반 보고서 자동 생성 시스템
+> Slack 명령어로 CSV 데이터를 기반으로 Word 문서를 자동 생성.
 
-## 핵심 원칙
+---
 
-- 검색된 문서 밖 내용은 지어내지 않는다 (fabrication 금지)
-- 모든 생성 문단에는 출처를 명시한다 (사내 문서 링크 또는 웹 URL)
-- 근거가 부족한 섹션은 자동 생성을 생략하고 사람 검토로 넘긴다
+## 1. 프로젝트 개요
 
-## 파이프라인
+### 1.1 목적
+- CSV 형식의 활동 데이터를 입력받아 정형화된 Word 보고서 자동 생성
+- Slack 봇을 통한 간편한 보고서 요청 및 수신
+- 근거 기반 작성으로 허위 내용(fabrication) 방지
 
-1. 섹션 주제를 보고 LLM이 근거 필요 여부 및 tool(사내 RAG / 웹 검색) 선택을 판단
-2. 사내 RAG 우선 호출 → 근거 부족 시 웹 검색으로 폴백
-3. LLM이 구조화된 JSON(`answer`, `source_type`, `source_count`, `source_relevance`, `has_fabrication_risk`)으로 응답
-4. 코드가 라우팅 결정 (자동 승인 / 검토 필요) — LLM은 라우팅에 관여하지 않음
-5. 결과를 docx에 삽입 (출처 인라인 표기 + 참고문서 목록)
+### 1.2 핵심 원칙
+- 검색된 문서 밖 내용은 생성하지 않음
+- 모든 생성 문단에 출처 명시 (제공 데이터 또는 웹 URL)
+- 근거 부족 섹션은 자동 생성 생략, 사람 검토로 전환
 
-## 실행 방법
+### 1.3 주요 기능
+| 기능 | 설명 |
+|------|------|
+| CSV 데이터 인제스트 | Slack에 첨부된 CSV 파일 자동 파싱 |
+| 템플릿 기반 문서 생성 | 보고서 템플릿에 내용 채워넣기 기능 지원 |
+| 섹션별 LLM 작성 | 개요, 주요내용, 결론 및 제언 자동 생성 |
+| 웹 검색 보강 | 필요한  섹션에 따라 웹 검색을 통한 트렌드/인사이트 추가 |
+| Word 문서 출력 | 로고, 서식, 참고자료 자동 삽입 |
 
-### 1. Ollama 설치
+---
 
-```bash
-# macOS
-brew install ollama
+## 2. 시스템 아키텍처
 
-# Linux
-curl -fsSL https://ollama.com/install.sh | sh
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│   Slack     │────▶│  slack_app  │────▶│  pipeline/  │
+│  (사용자)    │     │             │     │   main.py   │
+└─────────────┘     └─────────────┘     └─────────────┘
+                                              │
+                    ┌─────────────────────────┼─────────────────────────┐
+                    ▼                         ▼                         ▼
+             ┌─────────────┐          ┌─────────────┐          ┌─────────────┐
+             │ data_ingest │          │ llm_writer  │          │ web_search  │
+             │ (CSV 파싱)   │          │ (Groq API)  │          │(Tavily/Naver)│
+             └─────────────┘          └─────────────┘          └─────────────┘
+                                                                      │
+                                                                      ▼
+                                                               ┌─────────────┐
+                                                               │ docx_builder│
+                                                               │ (Word 생성) │
+                                                               └─────────────┘
 ```
 
-### 2. Ollama 서버 실행
+---
 
-```bash
-ollama serve
-```
+## 3. 환경 설정
 
-### 3. 모델 다운로드
+### 3.1 필수 요구사항
+- Python 3.11+
+- Groq API 키
+- Slack Bot/App 토큰
+- Tavily API 키 (글로벌 웹 검색용)
+- Naver Search API 키 (국내 웹 검색용)
 
-```bash
-ollama pull qwen2.5:7b-instruct-q4_0
-```
-
-### 4. Python 의존성 설치
+### 3.2 의존성 설치
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 5. 파이프라인 실행
+### 3.3 환경 변수 설정 (.env)
+
+```env
+# Groq LLM API
+GROQ_API_KEY="gsk_xxxxx"
+
+# Slack 봇 토큰
+SLACK_BOT_TOKEN="xoxb-xxxxx"
+SLACK_APP_TOKEN="xapp-xxxxx"
+
+# 웹 검색 API
+TAVILY_API_KEY="tvly-xxxxx"
+NAVER_CLIENT_ID="xxxxx"
+NAVER_CLIENT_SECRET="xxxxx"
+
+# 옵션: Mock 검색 모드 (API 크레딧 절약)
+USE_MOCK_SEARCH=false
+```
+
+---
+
+## 4. 실행 방법
+
+### 4.1 Slack 봇 실행
 
 ```bash
-python -m pipeline.main
+# 포그라운드 실행
+python slack_app.py
+
+# 백그라운드 실행 (권장)
+nohup python slack_app.py >> slack_app.log 2>&1 &
 ```
 
-실행 결과로 `output.docx` 파일이 생성됩니다.
-
-## 프로젝트 구조
+### 4.2 Slack 명령어
 
 ```
-pipeline/
-├── main.py           # 파이프라인 조립 및 실행
-├── rag_tool.py       # 사내 RAG 검색 (목업)
-├── web_search.py     # 웹 검색 (목업)
-├── llm_writer.py     # Ollama LLM 호출, 초안 생성, 응답 언어 검증(한글 비율/중국어 감지) 및 재시도
-├── router.py         # 승인 라우팅 결정
-└── docx_builder.py   # Word 문서 생성
-
-scripts/
-└── lang_guard_test.py  # 중국어 이탈률 실측 스크립트
-
-tests/
-├── test_lang_guard.py  # 언어 검증 함수 유닛 테스트 (llm_writer.py 대상)
-└── test_router.py
+/report [보고서 제목] --template [템플릿명]
 ```
 
-## 라우팅 규칙
+**사용 예시:**
+1. Slack 채널에서 CSV 파일 첨부
+2. 메시지에 명령어 입력:
+   ```
+   /report 7월 활동 보고서 --template gambarlabs_report
+   ```
+3. 봇이 Word 문서 생성 후 채널에 업로드
+
+### 4.3 지원 템플릿
+
+| 템플릿명 | 설명 | 섹션 구성 |
+|---------|------|----------|
+| `gambarlabs_report` | 감바랩스 활동 보고서 | 개요, 주요내용, 결론및제언 |
+| `제안서` | 일반 제안서 | 서론, 현황분석, 제안내용, 기대효과, 실행계획, 결론 |
+| `기술 보고서` | 기술 문서 | 서론, 기술개요, 상세분석, 적용사례, 결론 |
+
+### 4.4 직접 파이프라인 실행 (개발/테스트용)
+
+```bash
+python -c "
+from pipeline.data_ingest import ingest_tabular
+from pipeline.main import run_pipeline
+
+chunks = ingest_tabular('assets/mock_provided_data.csv')
+run_pipeline('7월 활동 보고서', template_hint='gambarlabs_report', provided_chunks=chunks)
+"
+```
+
+---
+
+## 5. 프로젝트 구조
+
+```
+grounded-report-workflow/
+├── slack_app.py              # Slack 봇 메인 (Socket Mode)
+├── .env                      # 환경 변수 (API 키 등)
+├── requirements.txt          # Python 의존성
+│
+├── pipeline/                 # 핵심 파이프라인 모듈
+│   ├── main.py               # 파이프라인 조립 및 실행
+│   ├── data_ingest.py        # CSV/엑셀 데이터 인제스트
+│   ├── section_planner.py    # 섹션 계획 생성
+│   ├── classifier.py         # 소스 타입 분류
+│   ├── llm_writer.py         # LLM 초안 생성 (Groq API)
+│   ├── web_search.py         # 웹 검색 (Tavily + Naver)
+│   ├── router.py             # 승인 라우팅 결정
+│   ├── docx_builder.py       # Word 문서 생성
+│   └── templates.py          # 문서 템플릿 정의
+│
+├── assets/                   # 정적 자산
+│   ├── gambarlabs_report_template.docx  # 보고서 템플릿
+│   ├── gambalabs-logo.png    # 로고 이미지
+│   └── mock_provided_data.csv # 테스트용 샘플 데이터
+│
+├── output/                   # 생성된 문서 출력 폴더
+│
+├── scripts/                  # 유틸리티 스크립트
+│   └── groq_model_comparison.py
+│
+└── tests/                    # 테스트
+    ├── test_lang_guard.py
+    └── test_router.py
+```
+
+---
+
+## 6. 핵심 모듈 설명
+
+### 6.1 slack_app.py
+- Slack Socket Mode로 실시간 이벤트 수신
+- `/report` 명령어 처리
+- CSV 파일 다운로드 및 파이프라인 호출
+- 생성된 문서 Slack 채널에 업로드
+
+### 6.2 pipeline/main.py
+- 전체 파이프라인 오케스트레이션
+- 템플릿 모드 vs 일반 모드 분기
+- 섹션별 LLM 호출 및 문서 조립
+- 로고 삽입, 글자색 통일 등 후처리
+
+### 6.3 pipeline/llm_writer.py
+- Groq API를 통한 LLM 호출
+- 모델: `openai/gpt-oss-20b`
+- 구조화된 JSON 응답 생성
+
+### 6.4 pipeline/docx_builder.py
+- python-docx 기반 Word 문서 생성
+- 템플릿 플레이스홀더 치환
+- 서식 적용 (폰트, 색상, 정렬 등)
+
+---
+
+## 7. 라우팅 규칙
 
 | source_type | source_relevance | has_fabrication_risk | 결과 |
 |-------------|------------------|----------------------|------|
 | none | - | - | 자동 승인 |
+| provided_data | - | false | 자동 승인 |
 | internal | high | false | 자동 승인 |
 | web | high/medium | false | 자동 승인 |
 | 그 외 | - | - | 검토 필요 |
 
-## 언어 검증 (하네스 + 재시도)
+---
 
-qwen2.5 모델은 약 20% 확률로 한국어 응답 중 중국어로 전환되는 현상이 있습니다 (`scripts/lang_guard_test.py` 실측 이탈률 23.3%). `llm_writer.py`에서 2단계로 방어합니다.
+## 8. 트러블슈팅
 
-1. **프롬프트 하네스 (1차, 사전 제어)**: 시스템 프롬프트에 "반드시 한국어로만 응답" 규칙과 few-shot 예시를 명시하여, 모델이 처음부터 언어를 이탈하지 않도록 유도합니다.
-2. **언어 검증 + 재시도 (2차)**: `check_korean_ratio`/`has_chinese`/`is_language_valid` 함수로 응답을 검증하고, 이탈 시 `_generate_with_lang_retry()`가 최대 5회까지 자동 재생성합니다.
-   - **한글 비율 체크**: 50% 이상 유지 (기술 용어 포함 시에도 통과)
-   - **중국어 감지**: 중국어가 한 글자라도 포함되면 즉시 재시도 (0% 허용)
-   - 5회를 모두 소진해도 이탈이 지속되면 `has_fabrication_risk=True`로 설정되어 검토 필요로 라우팅 (실측 기준 5회 연속 실패 확률 ≈ 0.07%)
+### 8.1 Rate Limit 에러 (429)
+```
+Rate limit reached for model `openai/gpt-oss-20b`
+```
+**원인:** Groq API 일일 토큰 한도 초과 (200,000 토큰/일)
+**해결:**
+- 표시된 시간만큼 대기 후 재시도
+- 다른 Groq 계정의 API 키 사용
 
-## 테스트 실행
+### 8.2 Slack 파일 다운로드 실패
+**원인:** Bot에 `files:read` 권한 없음
+**해결:** Slack App 설정에서 OAuth Scopes에 `files:read` 추가
+
+### 8.3 문서 생성 후 빈 섹션
+**원인:** CSV 데이터와 섹션 키워드 불일치
+**해결:**
+- CSV 컬럼명 확인 (날짜, 구분, 활동내용 등)
+- `templates.py`의 `match_keywords` 확인
+
+---
+
+## 9. 설정 변경
+
+### 9.1 LLM 모델 변경
+`pipeline/` 폴더 내 4개 파일에서 `MODEL_NAME` 수정:
+- `section_planner.py`
+- `classifier.py`
+- `llm_writer.py`
+- `web_search.py`
+
+### 9.2 템플릿 추가
+`pipeline/templates.py`의 `TEMPLATES` 딕셔너리에 새 템플릿 추가
+
+### 9.3 로고 변경
+`assets/gambalabs-logo.png` 파일 교체
+
+---
+
+## 10. 테스트
 
 ```bash
+# 전체 테스트 실행
 python -m pytest tests/ -v
+
+# 특정 테스트 실행
+python -m pytest tests/test_router.py -v
 ```
+
+---
+
+## 11. 참고 사항
+
+### 11.1 API 사용량
+- **Groq:** 무료 티어 200,000 토큰/일
+- **Tavily:** 무료 티어 1,000 검색/월
+- **Naver Search:** 무료 25,000 요청/일
+
+### 11.2 로그 확인
+```bash
+# 실시간 로그 확인
+tail -f slack_app.log
+
+# 최근 에러 확인
+grep -i error slack_app.log | tail -20
+```
+
+---
+
+## 12. 변경 이력
+
+| 날짜 | 버전 | 변경 내용 |
+|------|------|----------|
+| 2026-08-06 | 1.0 | 초기 핸드오버 문서 작성 |
+
+---
+
+*본 문서는 프로젝트 핸드오버를 위해 작성되었습니다.*
