@@ -107,7 +107,9 @@ _naver_call_count: int = 0
 def _is_mock_mode() -> bool:
     """USE_MOCK_SEARCH 환경변수 확인"""
     value = os.getenv("USE_MOCK_SEARCH", "false").strip().lower()
-    return value in ("true", "1", "yes")
+    result = value in ("true", "1", "yes")
+    print(f"[DEBUG] USE_MOCK_SEARCH={value}, _is_mock_mode={result}", flush=True)
+    return result
 
 
 # =============================================================================

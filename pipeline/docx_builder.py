@@ -716,7 +716,7 @@ def collect_references(all_sources: list[list[dict]]) -> list[dict]:
     Returns:
         중복 제거된 출처 리스트
     """
-    seen_urls = set()
+    seen_keys = set()
     unique_sources = []
 
     for sources in all_sources:
@@ -724,10 +724,20 @@ def collect_references(all_sources: list[list[dict]]) -> list[dict]:
             url = source.get("source_url", "")
             title = source.get("source_title", "")
 
-            # URL 기준으로 중복 체크 (URL 없으면 제목 기준)
-            key = url if url else title
-            if key and key not in seen_urls:
-                seen_urls.add(key)
+            # provided:// 프로토콜은 파일명만으로 중복 체크 (행 번호 무시)
+            # 예: "provided://file.csv#row1" → "provided://file.csv"
+            if url.startswith("provided://"):
+                key = url.split("#")[0]  # #row1, #chunk2 등 제거
+            else:
+                # 일반 URL은 전체 URL로 중복 체크 (URL 없으면 제목 기준)
+                key = url if url else title
+
+            if key and key not in seen_keys:
+                seen_keys.add(key)
+                # provided:// URL은 행 번호 없이 저장
+                if url.startswith("provided://"):
+                    source = source.copy()
+                    source["source_url"] = key
                 unique_sources.append(source)
 
     return unique_sources
@@ -1694,7 +1704,8 @@ def save_document(doc: Document, filepath: str) -> None:
 def _replace_placeholder_in_runs(paragraph, placeholder: str, content: str) -> bool:
     """
     문단의 run들에서 플레이스홀더를 치환합니다.
-    원본 run의 서식(bold, size, color 등)을 유지합니다.
+    색상은 항상 검정(000000), italic은 항상 False로 설정합니다.
+    단, {{TITLE}}은 원본 bold/size 유지, 색상만 검정으로.
 
     Args:
         paragraph: python-docx Paragraph 객체
@@ -1704,17 +1715,26 @@ def _replace_placeholder_in_runs(paragraph, placeholder: str, content: str) -> b
     Returns:
         치환 성공 여부
     """
+    from docx.shared import RGBColor
+
     # 전체 텍스트에 placeholder가 없으면 스킵
     if placeholder not in paragraph.text:
         return False
 
+    is_title = placeholder == "{{TITLE}}"
+
+    def _apply_standard_format(run):
+        """표준 서식 적용: 검정색, 이탤릭 해제"""
+        _set_korean_font(run)
+        run.font.color.rgb = RGBColor(0, 0, 0)  # 항상 검정
+        if not is_title:
+            run.font.italic = False  # TITLE 외에는 이탤릭 해제
+
     # Case 1: 단일 run에 placeholder가 완전히 포함된 경우
     for run in paragraph.runs:
         if placeholder in run.text:
-            # 원본 서식 유지하면서 텍스트만 치환
             run.text = run.text.replace(placeholder, content)
-            # 한글 폰트만 보장 (기존 size/color/bold는 유지)
-            _set_korean_font(run)
+            _apply_standard_format(run)
             return True
 
     # Case 2: placeholder가 여러 run에 걸쳐 분할된 경우
@@ -1728,7 +1748,7 @@ def _replace_placeholder_in_runs(paragraph, placeholder: str, content: str) -> b
             first_run = paragraph.runs[0]
             # 첫 번째 run에 전체 텍스트 설정
             first_run.text = new_text
-            _set_korean_font(first_run)
+            _apply_standard_format(first_run)
 
             # 나머지 run들은 텍스트 비움 (서식은 유지)
             for run in paragraph.runs[1:]:

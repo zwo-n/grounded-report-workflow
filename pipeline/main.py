@@ -125,12 +125,50 @@ def _generate_doc_number() -> str:
     return f"GBL-{date_str}-{seq}"
 
 
+def _extract_date_range_from_chunks(chunks: list) -> str:
+    """
+    provided_chunks에서 날짜 범위를 추출합니다.
+
+    Args:
+        chunks: ProvidedChunk 리스트
+
+    Returns:
+        "YYYY년 M월 D일 ~ YYYY년 M월 D일" 형식 문자열, 없으면 빈 문자열
+    """
+    import re
+    from datetime import datetime
+
+    date_pattern = re.compile(r"(\d{4})-(\d{1,2})-(\d{1,2})")
+    dates = []
+
+    for chunk in chunks:
+        content = chunk.get("content", "") if isinstance(chunk, dict) else ""
+        matches = date_pattern.findall(content)
+        for y, m, d in matches:
+            try:
+                dates.append(datetime(int(y), int(m), int(d)))
+            except ValueError:
+                pass
+
+    if not dates:
+        return ""
+
+    min_date = min(dates)
+    max_date = max(dates)
+
+    if min_date == max_date:
+        return f"{min_date.year}년 {min_date.month}월 {min_date.day}일"
+    else:
+        return f"{min_date.year}년 {min_date.month}월 {min_date.day}일 ~ {max_date.year}년 {max_date.month}월 {max_date.day}일"
+
+
 def _build_document_from_template(
     template_path: Path,
     document_title: str,
     section_results: list[tuple],
     unique_sources: list[dict],
     slack_user_name: str | None = None,
+    provided_chunks: list | None = None,
 ) -> Document:
     """
     템플릿 파일을 사용하여 문서를 생성합니다.
@@ -141,6 +179,7 @@ def _build_document_from_template(
         section_results: 섹션 처리 결과 리스트
         unique_sources: 중복 제거된 출처 리스트
         slack_user_name: Slack 사용자 이름 (작성자)
+        provided_chunks: 제공 데이터 (날짜 범위 추출용)
 
     Returns:
         생성된 Document 객체
@@ -156,21 +195,24 @@ def _build_document_from_template(
         if answer:
             section_contents.append(answer)
 
+    # 날짜 범위 추출
+    date_range = _extract_date_range_from_chunks(provided_chunks) if provided_chunks else ""
+
     # 플레이스홀더 딕셔너리 준비
     placeholders = {
         # 기본 정보
         "{{TITLE}}": document_title,
         "{{DATE}}": f"{today.year}년 {today.month}월 {today.day}일",
-        "{{AUTHOR}}": slack_user_name if slack_user_name else "[미지정]",
+        "{{AUTHOR}}": slack_user_name if slack_user_name else "",
         "{{FIELD}}": _infer_field_category(document_title, section_contents),
         "{{DOC_NO}}": _generate_doc_number(),
-        # 기간/프로젝트 (제공 데이터에서 추출 가능하면 좋지만 현재는 플레이스홀더)
-        "{{PERIOD}}": "[보고 기간]",
-        "{{PROJECT}}": "[프로젝트명]",
-        # 검토자 정보 (검토 시 기입)
-        "{{REVIEWER}}": "[검토자]",
-        "{{REVIEW_DATE}}": "[검토일]",
-        # 기타 플레이스홀더 (사용되지 않는 경우 빈 값)
+        # 기간/프로젝트
+        "{{PERIOD}}": date_range,  # CSV에서 추출한 날짜 범위
+        "{{PROJECT}}": "",
+        # 검토자 정보 (비워둠 - 검토 시 기입)
+        "{{REVIEWER}}": "",
+        "{{REVIEW_DATE}}": "",
+        # 기타 플레이스홀더
         "{{PLACEHOLDER}}": "",
     }
 
@@ -178,11 +220,15 @@ def _build_document_from_template(
     for section, llm_result, decision, sources, _ in section_results:
         title = section["title"]
         answer = llm_result.get("answer", "")
+        print(f"[DEBUG] 섹션 '{title}': answer 길이={len(answer)}, decision={decision}", flush=True)
 
         # 섹션 제목을 플레이스홀더 키로 변환
         placeholder_key = _SECTION_TO_PLACEHOLDER.get(title)
         if placeholder_key:
             placeholders[f"{{{{{placeholder_key}}}}}"] = answer
+            print(f"[DEBUG] 플레이스홀더 {{{{{placeholder_key}}}}} 설정됨", flush=True)
+        else:
+            print(f"[DEBUG] 플레이스홀더 매핑 없음: {title}", flush=True)
 
     # 참고 자료 목록 생성
     if unique_sources:
@@ -200,6 +246,44 @@ def _build_document_from_template(
 
     # 템플릿에서 문서 생성
     doc = build_from_template(template_path, placeholders)
+
+    # 로고 삽입 (XML 레벨에서 첫 번째 테이블 앞에)
+    logo_path = Path(__file__).parent.parent / "assets" / "gambalabs-logo.png"
+    if logo_path.exists() and doc.tables:
+        from docx.shared import Inches
+        from docx.oxml.ns import qn
+        from docx.oxml import OxmlElement
+        from lxml import etree
+
+        # 새 단락 XML 요소 생성
+        new_p = OxmlElement('w:p')
+        # 단락 속성 (왼쪽 정렬)
+        pPr = OxmlElement('w:pPr')
+        jc = OxmlElement('w:jc')
+        jc.set(qn('w:val'), 'left')
+        pPr.append(jc)
+        new_p.append(pPr)
+
+        # 첫 번째 테이블 앞에 단락 삽입
+        first_table = doc.tables[0]
+        first_table._element.addprevious(new_p)
+
+        # 삽입된 단락을 python-docx Paragraph로 래핑하여 이미지 추가
+        from docx.text.paragraph import Paragraph
+        logo_para = Paragraph(new_p, doc)
+        run = logo_para.add_run()
+        run.add_picture(str(logo_path), width=Inches(1.2))
+
+    # 문서 전체 run 색상을 검정으로 통일 (템플릿 고정 텍스트 포함)
+    from docx.shared import RGBColor
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    for run in para.runs:
+                        run.font.color.rgb = RGBColor(0, 0, 0)
+                        run.font.italic = False
+
     return doc
 
 
@@ -351,21 +435,30 @@ def process_section_with_provided_data(
 
     # 3. 매칭 결과에 따른 처리
     if not matched_chunks:
-        # 매칭 없음 → 근거 부족 처리
-        llm_result = {
-            "answer": "[근거 부족] 제공된 데이터에서 이 섹션에 해당하는 내용을 찾을 수 없습니다.",
-            "source_type": "provided_data",
-            "source_count": 0,
-            "source_relevance": "low",
-            "has_fabrication_risk": False,
-        }
-        decision = route(
-            source_type="provided_data",
-            source_count=0,
-            source_relevance="low",
-            has_fabrication_risk=False,
-        )
-        return llm_result, decision, [], "provided_data"
+        # 매칭 없음 → 개요/요약 섹션이면 전체 데이터로 요약 생성
+        overview_keywords = ["개요", "요약", "소개", "배경", "목적", "overview", "summary"]
+        is_overview_section = any(kw in title.lower() for kw in overview_keywords)
+
+        if is_overview_section and provided_chunks:
+            # 전체 데이터에서 상위 5개를 사용해 개요 생성
+            print(f"  -> 개요 섹션: 전체 데이터({len(provided_chunks)}개)로 요약 생성")
+            matched_chunks = provided_chunks[:5]
+        else:
+            # 다른 섹션은 근거 부족 처리
+            llm_result = {
+                "answer": "[근거 부족] 제공된 데이터에서 이 섹션에 해당하는 내용을 찾을 수 없습니다.",
+                "source_type": "provided_data",
+                "source_count": 0,
+                "source_relevance": "low",
+                "has_fabrication_risk": False,
+            }
+            decision = route(
+                source_type="provided_data",
+                source_count=0,
+                source_relevance="low",
+                has_fabrication_risk=False,
+            )
+            return llm_result, decision, [], "provided_data"
 
     # 4. LLM 호출 (매칭된 chunk를 sources로 전달)
     # chunk를 기존 sources 형식으로 변환
@@ -379,10 +472,32 @@ def process_section_with_provided_data(
         for chunk in matched_chunks[:5]  # 최대 5개
     ]
 
+    # 5. 결론/제언 섹션이면 웹 검색 추가 (인사이트, 트렌드 보강)
+    conclusion_keywords = ["결론", "제언", "향후", "제안", "conclusion", "recommendation"]
+    is_conclusion_section = any(kw in title.lower() for kw in conclusion_keywords)
+
+    if is_conclusion_section and document_title:
+        print(f"  -> 결론 섹션: 웹 검색으로 인사이트 보강")
+        # 문서 주제 기반 웹 검색 쿼리 생성
+        web_query = f"{document_title} 트렌드 인사이트 베스트프랙티스"
+        web_response = search_web(web_query, max_results=3, topic=document_title)
+        web_results = web_response.get("results", []) if isinstance(web_response, dict) else []
+
+        if web_results:
+            print(f"  -> 웹 검색 결과: {len(web_results)}건")
+            # 웹 검색 결과를 sources에 추가
+            for web_source in web_results:
+                sources.append({
+                    "content": web_source.get("content", ""),
+                    "source_title": web_source.get("source_title", "웹 검색"),
+                    "source_url": web_source.get("source_url", ""),
+                    "score": web_source.get("score", 0.8),
+                })
+
     llm_result = generate_section_draft(
         section_query=query,
         sources=sources,
-        source_type="provided_data",
+        source_type="provided_data",  # 여전히 provided_data 기반 (웹은 보조)
         llm_client=llm_client,
         topic=document_title,
     )
@@ -443,6 +558,7 @@ def run_pipeline(
         and provided_chunks
         and is_fixed_template(template_hint)
     )
+    print(f"[DEBUG] use_fixed={use_fixed}, force_fixed_template={force_fixed_template}, template_hint={template_hint}, provided_chunks_len={len(provided_chunks) if provided_chunks else 0}", flush=True)
 
     # 섹션 구성 생성 (단일 LLM 호출로 문서 제목 + 유형 감지 + 섹션 생성)
     # 고정 템플릿이면 LLM 호출 스킵
@@ -472,6 +588,7 @@ def run_pipeline(
     # 템플릿 파일 경로 확인 (고정 템플릿이면서 docx_template_path가 있는 경우)
     template_file_path = get_template_path(template_hint) if template_hint else None
     use_template_file = template_file_path is not None and use_fixed
+    print(f"[DEBUG] template_file_path={template_file_path}, use_template_file={use_template_file}", flush=True)
 
     if use_template_file:
         print(f"[템플릿 문서] {template_file_path} 사용")
@@ -520,6 +637,7 @@ def run_pipeline(
             section_results,
             unique_sources,
             slack_user_name=slack_user_name,
+            provided_chunks=provided_chunks,
         )
     else:
         # 일반 문서 생성
