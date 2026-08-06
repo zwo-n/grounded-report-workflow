@@ -1691,9 +1691,58 @@ def save_document(doc: Document, filepath: str) -> None:
 # =============================================================================
 # 템플릿 기반 문서 생성 (provided_data 모드용)
 # =============================================================================
+def _replace_placeholder_in_runs(paragraph, placeholder: str, content: str) -> bool:
+    """
+    문단의 run들에서 플레이스홀더를 치환합니다.
+    원본 run의 서식(bold, size, color 등)을 유지합니다.
+
+    Args:
+        paragraph: python-docx Paragraph 객체
+        placeholder: 플레이스홀더 문자열 (예: "{{TITLE}}")
+        content: 치환할 내용
+
+    Returns:
+        치환 성공 여부
+    """
+    # 전체 텍스트에 placeholder가 없으면 스킵
+    if placeholder not in paragraph.text:
+        return False
+
+    # Case 1: 단일 run에 placeholder가 완전히 포함된 경우
+    for run in paragraph.runs:
+        if placeholder in run.text:
+            # 원본 서식 유지하면서 텍스트만 치환
+            run.text = run.text.replace(placeholder, content)
+            # 한글 폰트만 보장 (기존 size/color/bold는 유지)
+            _set_korean_font(run)
+            return True
+
+    # Case 2: placeholder가 여러 run에 걸쳐 분할된 경우
+    # 전체 텍스트를 모아서 치환 후, 첫 번째 run에 넣고 나머지는 비움
+    full_text = paragraph.text
+    if placeholder in full_text:
+        new_text = full_text.replace(placeholder, content)
+
+        # 첫 번째 run의 서식 정보 저장
+        if paragraph.runs:
+            first_run = paragraph.runs[0]
+            # 첫 번째 run에 전체 텍스트 설정
+            first_run.text = new_text
+            _set_korean_font(first_run)
+
+            # 나머지 run들은 텍스트 비움 (서식은 유지)
+            for run in paragraph.runs[1:]:
+                run.text = ""
+
+            return True
+
+    return False
+
+
 def _replace_placeholder_in_cell(cell, placeholder: str, content: str) -> bool:
     """
     표 셀 내 플레이스홀더를 콘텐츠로 치환합니다.
+    원본 서식(bold, size, color 등)을 유지합니다.
 
     Args:
         cell: python-docx TableCell 객체
@@ -1705,21 +1754,39 @@ def _replace_placeholder_in_cell(cell, placeholder: str, content: str) -> bool:
     """
     replaced = False
     for paragraph in cell.paragraphs:
-        if placeholder in paragraph.text:
-            # 기존 텍스트에서 플레이스홀더 치환
-            paragraph.text = paragraph.text.replace(placeholder, content)
-            # 폰트 스타일 적용
-            for run in paragraph.runs:
-                _set_korean_font(run)
-                run.font.size = DEFAULT_FONT_SIZE
-                run.font.color.rgb = COLOR_TEXT_GRAY
+        if _replace_placeholder_in_runs(paragraph, placeholder, content):
             replaced = True
     return replaced
 
 
+def _replace_placeholder_in_table(table, placeholder: str, content: str) -> int:
+    """
+    표 내 플레이스홀더를 치환합니다 (중첩 표 포함).
+
+    Args:
+        table: python-docx Table 객체
+        placeholder: 플레이스홀더 문자열
+        content: 치환할 내용
+
+    Returns:
+        치환된 횟수
+    """
+    count = 0
+    for row in table.rows:
+        for cell in row.cells:
+            # 셀 내 문단 치환
+            if _replace_placeholder_in_cell(cell, placeholder, content):
+                count += 1
+            # 중첩 표 재귀 처리
+            for nested_table in cell.tables:
+                count += _replace_placeholder_in_table(nested_table, placeholder, content)
+    return count
+
+
 def _replace_placeholder_in_document(doc: Document, placeholder: str, content: str) -> int:
     """
-    문서 전체에서 플레이스홀더를 치환합니다 (표 + 문단).
+    문서 전체에서 플레이스홀더를 치환합니다 (표 + 중첩 표 + 문단).
+    원본 서식을 유지합니다.
 
     Args:
         doc: python-docx Document 객체
@@ -1731,19 +1798,13 @@ def _replace_placeholder_in_document(doc: Document, placeholder: str, content: s
     """
     count = 0
 
-    # 표 내 치환
+    # 표 내 치환 (중첩 표 포함)
     for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                if _replace_placeholder_in_cell(cell, placeholder, content):
-                    count += 1
+        count += _replace_placeholder_in_table(table, placeholder, content)
 
     # 문단 내 치환 (표지 등)
     for paragraph in doc.paragraphs:
-        if placeholder in paragraph.text:
-            paragraph.text = paragraph.text.replace(placeholder, content)
-            for run in paragraph.runs:
-                _set_korean_font(run)
+        if _replace_placeholder_in_runs(paragraph, placeholder, content):
             count += 1
 
     return count

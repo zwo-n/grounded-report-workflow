@@ -54,12 +54,83 @@ _SECTION_TO_PLACEHOLDER = {
     "결론및제언": "CONCLUSION",
 }
 
+# {{FIELD}} 추론용 키워드 → 카테고리 매핑
+# 주의: 키워드 중복 금지 (한 키워드는 하나의 카테고리에만 속해야 함)
+_FIELD_KEYWORDS = {
+    "개발": ["개발", "구현", "코딩", "프로그래밍", "API", "기능", "모듈", "코드"],
+    "테스트": ["테스트", "QA", "검증", "버그", "디버깅", "품질"],
+    "회의": ["회의", "미팅", "논의", "협의", "조율", "커뮤니케이션"],
+    "기획": ["기획", "설계", "아키텍처", "요구사항", "정의"],  # "분석" 제거 (연구에 귀속)
+    "문서화": ["문서", "매뉴얼", "가이드", "작성", "정리"],
+    "배포": ["배포", "릴리즈", "운영", "인프라", "서버", "클라우드"],
+    "연구": ["연구", "조사", "분석", "리서치", "POC", "실험"],  # "분석"은 여기에만
+    "교육": ["교육", "학습", "세미나", "워크샵", "온보딩"],
+}
+
+
+def _infer_field_category(document_title: str, section_contents: list[str]) -> str:
+    """
+    문서 제목과 섹션 내용을 분석하여 FIELD 카테고리를 추론합니다.
+
+    Args:
+        document_title: 문서 제목
+        section_contents: 섹션 내용 리스트
+
+    Returns:
+        추론된 카테고리 (예: "개발", "활동", "프로젝트 진행")
+    """
+    # 분석할 전체 텍스트 결합
+    all_text = document_title + " " + " ".join(section_contents)
+    all_text_lower = all_text.lower()
+
+    # 각 카테고리별 매칭 점수 계산
+    category_scores: dict[str, int] = {}
+    for category, keywords in _FIELD_KEYWORDS.items():
+        score = sum(1 for kw in keywords if kw in all_text_lower)
+        if score > 0:
+            category_scores[category] = score
+
+    # 최고 점수 카테고리 반환
+    if category_scores:
+        best_category = max(category_scores, key=category_scores.get)
+        return best_category
+
+    # 매칭 없으면 제목에서 유형 추론
+    if "보고서" in document_title:
+        return "활동"
+    if "제안서" in document_title:
+        return "기획"
+
+    return "프로젝트 진행"
+
+
+def _generate_doc_number() -> str:
+    """
+    문서 번호를 생성합니다.
+    형식: GBL-YYYYMMDD-순번
+
+    Returns:
+        생성된 문서 번호
+    """
+    from datetime import date
+
+    today = date.today()
+    date_str = today.strftime("%Y%m%d")
+
+    # 동일 날짜 문서 수 계산 (출력 디렉토리 기준)
+    # 실제로는 DB나 파일 기반으로 관리하는 것이 좋지만,
+    # 여기서는 간단히 01로 고정
+    seq = "01"
+
+    return f"GBL-{date_str}-{seq}"
+
 
 def _build_document_from_template(
     template_path: Path,
     document_title: str,
     section_results: list[tuple],
     unique_sources: list[dict],
+    slack_user_name: str | None = None,
 ) -> Document:
     """
     템플릿 파일을 사용하여 문서를 생성합니다.
@@ -69,19 +140,38 @@ def _build_document_from_template(
         document_title: 문서 제목
         section_results: 섹션 처리 결과 리스트
         unique_sources: 중복 제거된 출처 리스트
+        slack_user_name: Slack 사용자 이름 (작성자)
 
     Returns:
         생성된 Document 객체
     """
     from datetime import date
 
+    today = date.today()
+
+    # 섹션 내용 수집 (FIELD 추론용)
+    section_contents = []
+    for section, llm_result, decision, sources, _ in section_results:
+        answer = llm_result.get("answer", "")
+        if answer:
+            section_contents.append(answer)
+
     # 플레이스홀더 딕셔너리 준비
     placeholders = {
+        # 기본 정보
         "{{TITLE}}": document_title,
+        "{{DATE}}": f"{today.year}년 {today.month}월 {today.day}일",
+        "{{AUTHOR}}": slack_user_name if slack_user_name else "[미지정]",
+        "{{FIELD}}": _infer_field_category(document_title, section_contents),
+        "{{DOC_NO}}": _generate_doc_number(),
+        # 기간/프로젝트 (제공 데이터에서 추출 가능하면 좋지만 현재는 플레이스홀더)
         "{{PERIOD}}": "[보고 기간]",
         "{{PROJECT}}": "[프로젝트명]",
+        # 검토자 정보 (검토 시 기입)
         "{{REVIEWER}}": "[검토자]",
         "{{REVIEW_DATE}}": "[검토일]",
+        # 기타 플레이스홀더 (사용되지 않는 경우 빈 값)
+        "{{PLACEHOLDER}}": "",
     }
 
     # 섹션 내용 매핑
@@ -98,12 +188,12 @@ def _build_document_from_template(
     if unique_sources:
         ref_lines = []
         for i, source in enumerate(unique_sources, 1):
-            title = source.get("source_title", "출처")
+            src_title = source.get("source_title", "출처")
             url = source.get("source_url", "")
             if url:
-                ref_lines.append(f"{i}. {title}\n   {url}")
+                ref_lines.append(f"{i}. {src_title}\n   {url}")
             else:
-                ref_lines.append(f"{i}. {title}")
+                ref_lines.append(f"{i}. {src_title}")
         placeholders["{{REFERENCES}}"] = "\n".join(ref_lines)
     else:
         placeholders["{{REFERENCES}}"] = "(참고 자료 없음)"
@@ -316,6 +406,7 @@ def run_pipeline(
     planner_client: Callable[[list[dict]], str] | None = None,
     provided_chunks: list[ProvidedChunk] | None = None,
     force_fixed_template: bool = False,
+    slack_user_name: str | None = None,
 ) -> None:
     """
     전체 파이프라인을 실행합니다.
@@ -329,6 +420,7 @@ def run_pipeline(
         planner_client: 섹션 계획용 LLM 클라이언트 (None이면 실제 Groq API 호출)
         provided_chunks: 제공 데이터 chunk 리스트 (1회성, 메모리 한정, RAG와 분리)
         force_fixed_template: True면 고정 템플릿 강제 사용 (LLM 섹션 계획 스킵)
+        slack_user_name: Slack 사용자 이름 (템플릿 {{AUTHOR}} 필드용, None이면 "[미지정]")
 
     Note:
         provided_chunks가 제공되면:
@@ -427,6 +519,7 @@ def run_pipeline(
             document_title,
             section_results,
             unique_sources,
+            slack_user_name=slack_user_name,
         )
     else:
         # 일반 문서 생성

@@ -89,10 +89,35 @@ def format_summary_for_slack(summary: dict) -> str:
     return "\n".join(lines)
 
 
+def get_user_display_name(client, user_id: str) -> str:
+    """
+    Slack API를 호출하여 사용자의 표시 이름을 가져옵니다.
+
+    Args:
+        client: Slack WebClient 인스턴스
+        user_id: Slack 사용자 ID
+
+    Returns:
+        사용자 표시 이름 (display_name > real_name > user_id 순으로 폴백)
+    """
+    try:
+        result = client.users_info(user=user_id)
+        if result.get("ok"):
+            profile = result.get("user", {}).get("profile", {})
+            # display_name이 있으면 사용, 없으면 real_name
+            display_name = profile.get("display_name") or ""
+            real_name = profile.get("real_name") or ""
+            return display_name.strip() or real_name.strip() or f"User-{user_id}"
+    except Exception as e:
+        logger.warning(f"사용자 정보 조회 실패: {e}")
+    return f"User-{user_id}"
+
+
 def run_pipeline_in_background(
     user_request: str,
     channel_id: str,
     user_id: str,
+    user_display_name: str,
     client,
 ):
     """
@@ -102,16 +127,17 @@ def run_pipeline_in_background(
         user_request: 사용자 요청 문자열
         channel_id: 결과를 전송할 Slack 채널 ID
         user_id: 요청한 사용자 ID
+        user_display_name: 사용자 표시 이름 (Slack API에서 조회한 값)
         client: Slack WebClient 인스턴스
     """
     from test_real_doc import run_real_pipeline
 
     try:
-        logger.info(f"파이프라인 시작: '{user_request}' (user={user_id})")
+        logger.info(f"파이프라인 시작: '{user_request}' (user={user_display_name})")
 
         output_path, summary = run_real_pipeline(
             user_request=user_request,
-            author=f"Slack User <@{user_id}>",
+            author=user_display_name,
             verbose=True,
             return_summary=True,
         )
@@ -192,10 +218,14 @@ def handle_report_command(ack, command, client, respond):
 
     logger.info(f"/report 명령 수신: user={user_id}, text='{text[:50]}...'")
 
+    # Slack API로 사용자 표시 이름 조회
+    user_display_name = get_user_display_name(client, user_id)
+    logger.info(f"사용자 이름 조회: {user_id} -> {user_display_name}")
+
     # 백그라운드 스레드에서 파이프라인 실행
     thread = threading.Thread(
         target=run_pipeline_in_background,
-        args=(text, channel_id, user_id, client),
+        args=(text, channel_id, user_id, user_display_name, client),
         daemon=True,
     )
     thread.start()
